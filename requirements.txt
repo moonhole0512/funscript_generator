@@ -1,0 +1,11 @@
+torch
+torchvision
+opencv-python
+numpy
+scipy
+tqdm
+fastdtw
+matplotlib
+flet>=0.80.5
+flet-desktop>=0.80.5
+flet-dropzone>=0.3.1
