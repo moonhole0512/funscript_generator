@@ -1665,6 +1665,103 @@ class OneEuroFilter:
         self._dx_prev = 0.0
 
 
+class SceneTypeDetector:
+    """
+    P1/P2 키포인트 상대 거리를 분석하여 장면 유형을 자동 감지.
+
+    유형:
+      'HIP_HIP'       — 정상위/후배위: 두 골반이 근접
+      'BJ'            — 펠라치오: 머리가 상대 골반에 근접
+      'POV'           — 1인칭: P2 미감지
+      'OPTICAL_FLOW'  — fallback (분류 불가)
+
+    안정화: STABLE_SEC 초 이상 동일 유형 지속 시 전환 확정.
+    """
+    STABLE_SEC = 5.0   # 유형 전환 안정화 시간 (초)
+    BJ_RATIO   = 0.65  # BJ 판단: head-hip dist < hip-hip dist × BJ_RATIO
+    HIP_CLOSE  = 0.35  # HIP_HIP 판단: 두 골반 거리 (frame_h 정규화)
+
+    def __init__(self, fps: float):
+        self._fps = max(fps, 1.0)
+        self._current_type  = 'OPTICAL_FLOW'
+        self._candidate     = 'OPTICAL_FLOW'
+        self._cand_frames   = 0
+        self._stable_frames = int(self._fps * self.STABLE_SEC)
+
+    def update(self, p1_kp, p2_kp, p2_hip_y, frame_h: int) -> str:
+        """
+        p1_kp, p2_kp: np.ndarray shape(17,3) [x,y,conf] or None
+        p2_hip_y: P2 hip_center_y (정규화 0~1) or None
+        반환: 현재 안정화된 scene_type 문자열
+        """
+        candidate = self._classify(p1_kp, p2_kp, p2_hip_y, frame_h)
+        if candidate == self._candidate:
+            self._cand_frames += 1
+        else:
+            self._candidate   = candidate
+            self._cand_frames = 1
+        if self._cand_frames >= self._stable_frames:
+            self._current_type = self._candidate
+        return self._current_type
+
+    def _classify(self, p1_kp, p2_kp, p2_hip_y, frame_h) -> str:
+        # P2 완전 미감지 → POV 추정
+        if p2_kp is None and p2_hip_y is None:
+            return 'POV'
+        if p1_kp is None or p2_kp is None:
+            return 'OPTICAL_FLOW'
+
+        def _hip_center(kp):
+            lhx, lhy, lhc = kp[11]; rhx, rhy, rhc = kp[12]
+            if lhc > 0.25 and rhc > 0.25:
+                return ((lhx + rhx) / 2, (lhy + rhy) / 2)
+            elif lhc > 0.25:
+                return (lhx, lhy)
+            elif rhc > 0.25:
+                return (rhx, rhy)
+            return None
+
+        def _head(kp):
+            # 코(0) → 눈(1,2) → 귀(3,4) 순서로 fallback
+            for ki in [0, 1, 2, 3, 4]:
+                if ki < kp.shape[0] and kp[ki][2] > 0.20:
+                    return (kp[ki][0], kp[ki][1])
+            return None
+
+        def _dist(a, b):
+            return ((a[0] - b[0])**2 + (a[1] - b[1])**2)**0.5
+
+        p1_hip  = _hip_center(p1_kp)
+        p2_hip  = _hip_center(p2_kp)
+        if p1_hip is None or p2_hip is None:
+            return 'OPTICAL_FLOW'
+
+        hh_dist = _dist(p1_hip, p2_hip) / max(frame_h, 1)
+
+        # BJ 판단: P1 머리↔P2 골반 또는 P2 머리↔P1 골반 중 가까운 쪽
+        p1_head = _head(p1_kp)
+        p2_head = _head(p2_kp)
+        if p1_head is not None:
+            h1_dist = _dist(p1_head, p2_hip) / max(frame_h, 1)
+            if h1_dist < hh_dist * self.BJ_RATIO:
+                return 'BJ'
+        if p2_head is not None:
+            h2_dist = _dist(p2_head, p1_hip) / max(frame_h, 1)
+            if h2_dist < hh_dist * self.BJ_RATIO:
+                return 'BJ'
+
+        # HIP_HIP 판단
+        if hh_dist < self.HIP_CLOSE:
+            return 'HIP_HIP'
+
+        return 'OPTICAL_FLOW'
+
+    def reset(self):
+        self._current_type = 'OPTICAL_FLOW'
+        self._candidate    = 'OPTICAL_FLOW'
+        self._cand_frames  = 0
+
+
 class YoloPoseTracker:
     """
     YOLOv8/v11 Pose 기반 인물 감지 + 골반 키포인트 추출.
@@ -1730,15 +1827,23 @@ class YoloPoseTracker:
         self._use_tracking = True   # False → detection-only fallback
         self._track_id_map = {}     # track_id(int) → slot_index(int)
 
+        # P1 Centroid EMA — track ID가 바뀌어도 위치 기반으로 P1 재고정
+        self._p1_centroid_ema = None   # (cx, cy) EMA 값
+        self._p1_ema_alpha = 0.15      # 느린 EMA (갑작스러운 위치 변화에 둔감)
+
     def _make_slot(self, cx, cy):
         return {
-            'cx': cx,               # bbox 중심 x (정규화)
-            'cy': cy,               # bbox 중심 y (정규화)
+            'cx': cx,                    # bbox 중심 x (정규화)
+            'cy': cy,                    # bbox 중심 y (정규화)
             'hip_history': self._deque_cls(maxlen=self.HIP_HISTORY_LEN),
             'last_result': None,
-            'miss': 0,              # 연속 미탐지 프레임 수
-            'smoothed_hip_y': None, # 평활화된 hip_y
-            'hip_oef': None,        # OneEuroFilter (lazy init)
+            'miss': 0,                   # 연속 미탐지 프레임 수
+            'smoothed_hip_y': None,      # 평활화된 hip_y
+            'hip_oef': None,             # OneEuroFilter for hip_y (lazy init)
+            'shoulder_oef': None,        # OneEuroFilter for shoulder_y (lazy init)
+            'knee_oef': None,            # OneEuroFilter for knee_y (lazy init)
+            'smoothed_shoulder_y': None,
+            'smoothed_knee_y': None,
         }
 
     @staticmethod
@@ -1960,6 +2065,32 @@ class YoloPoseTracker:
                 out.append(base)
                 continue
 
+            # ── Bbox 범위 외 키포인트 무효화 (Frankenstein 방지) ────────────
+            # bbox를 수직 20%, 수평 25% 확장하여 머리/발끝 키포인트 수용
+            bx1, by1, bx2, by2 = bbox
+            _bw = bx2 - bx1
+            _bh = by2 - by1
+            _vx1 = bx1 - _bw * 0.25
+            _vx2 = bx2 + _bw * 0.25
+            _vy1 = by1 - _bh * 0.20
+            _vy2 = by2 + _bh * 0.20
+            kp = kp.copy()
+            for _ki in range(kp.shape[0]):
+                _kx, _ky, _kc = kp[_ki]
+                if _kc > 0.10 and not (_vx1 <= _kx <= _vx2 and _vy1 <= _ky <= _vy2):
+                    kp[_ki, 2] = 0.0   # bbox 밖 → 신뢰도 0
+
+            # ── 해부학적 수직 순서 검증 (어깨 y < 골반 y < 무릎 y) ─────────
+            def _ky_val(ki):
+                return kp[ki][1] if kp[ki][2] > 0.20 else None
+            _sh_y  = next((_ky_val(ki) for ki in [5, 6]  if _ky_val(ki) is not None), None)
+            _hp_y  = next((_ky_val(ki) for ki in [11, 12] if _ky_val(ki) is not None), None)
+            _kn_y  = next((_ky_val(ki) for ki in [13, 14] if _ky_val(ki) is not None), None)
+            if _sh_y is not None and _hp_y is not None and _sh_y > _hp_y:
+                for _ki in [5, 6]:   kp[_ki, 2] = 0.0   # 어깨가 골반보다 낮음 → 비정상
+            if _hp_y is not None and _kn_y is not None and _hp_y > _kn_y:
+                for _ki in [13, 14]: kp[_ki, 2] = 0.0   # 골반이 무릎보다 낮음 → 비정상
+
             base['keypoints'] = kp
             hip_y = self._estimate_hip_y_robust(kp, fh)
 
@@ -1987,6 +2118,7 @@ class YoloPoseTracker:
         empty = {'hip_center_y': None, 'reference_length': None,
                  'confidence': 0.0, 'bbox': None, 'keypoints': None,
                  'secondary_hip_y': None, 'secondary_bbox': None,
+                 'secondary_keypoints': None,
                  'rel_dist': None, 'is_dual': False}
 
         # 슬롯 미탐지 카운터 증가
@@ -2073,6 +2205,41 @@ class YoloPoseTracker:
                 s['smoothed_hip_y'] = smoothed
                 p = dict(p)  # 복사하여 반환값용 hip_center_y만 스무딩 적용
                 p['hip_center_y'] = smoothed
+
+            # shoulder_y, knee_y OneEuro 스무딩
+            _kp = p.get('keypoints')
+            if _kp is not None and _kp.shape[0] > 6:
+                _lsc, _rsc = _kp[5][2], _kp[6][2]
+                if _lsc > 0.25 or _rsc > 0.25:
+                    _w_sum = _lsc + _rsc
+                    _sh_raw = (_kp[5][1] * _lsc + _kp[6][1] * _rsc) / _w_sum / fh
+                    if s['shoulder_oef'] is None:
+                        s['shoulder_oef'] = OneEuroFilter(
+                            self._fps, min_cutoff=2.0, beta=5.0, d_cutoff=5.0
+                        )
+                    s['smoothed_shoulder_y'] = s['shoulder_oef'](_sh_raw)
+            if _kp is not None and _kp.shape[0] > 14:
+                _lkc, _rkc = _kp[13][2], _kp[14][2]
+                if _lkc > 0.25 or _rkc > 0.25:
+                    _w_sum = _lkc + _rkc
+                    _kn_raw = (_kp[13][1] * _lkc + _kp[14][1] * _rkc) / _w_sum / fh
+                    if s['knee_oef'] is None:
+                        s['knee_oef'] = OneEuroFilter(
+                            self._fps, min_cutoff=2.0, beta=5.0, d_cutoff=5.0
+                        )
+                    s['smoothed_knee_y'] = s['knee_oef'](_kn_raw)
+
+            # P1 centroid EMA 갱신 (slots[0] = P1)
+            if best_si == 0:
+                if self._p1_centroid_ema is None:
+                    self._p1_centroid_ema = (p['cx'], p['cy'])
+                else:
+                    ecx, ecy = self._p1_centroid_ema
+                    self._p1_centroid_ema = (
+                        ecx * (1 - self._p1_ema_alpha) + p['cx'] * self._p1_ema_alpha,
+                        ecy * (1 - self._p1_ema_alpha) + p['cy'] * self._p1_ema_alpha,
+                    )
+
             s['last_result'] = p
             matched_slots.add(best_si)
 
@@ -2084,6 +2251,31 @@ class YoloPoseTracker:
         if not self._slots:
             return empty
 
+        # ── P1 centroid 재배정 ───────────────────────────────────────────────
+        # P1(slots[0])이 이번 프레임 미탐지이고 centroid EMA가 있으면,
+        # 탐지된 인물 중 가장 가까운 인물을 P1으로 강제 배정
+        if (len(self._slots) >= 1 and
+                self._slots[0]['last_result'] is None and
+                self._p1_centroid_ema is not None and
+                persons):
+            ecx, ecy = self._p1_centroid_ema
+            best_p, best_d = None, float('inf')
+            for p in persons:
+                d = ((p['cx'] - ecx)**2 + (p['cy'] - ecy)**2)**0.5
+                if d < best_d:
+                    best_d = d
+                    best_p = p
+            # 거리 임계값: 프레임 대각선의 40% 이내
+            if best_p is not None and best_d < 0.40:
+                s0 = self._slots[0]
+                s0['cx'] = best_p['cx'] * 0.3 + s0['cx'] * 0.7
+                s0['cy'] = best_p['cy'] * 0.3 + s0['cy'] * 0.7
+                s0['miss'] = 0
+                s0['last_result'] = best_p
+                # 이 탐지가 P2 슬롯에 배정됐으면 P2에서 제거
+                if len(self._slots) >= 2 and self._slots[1]['last_result'] is best_p:
+                    self._slots[1]['last_result'] = None
+
         # P1은 항상 slots[0] — 교체 없음
         primary = self._slots[0]
         if primary['last_result'] is None:
@@ -2091,15 +2283,16 @@ class YoloPoseTracker:
             if len(self._slots) >= 2 and self._slots[1]['last_result'] is not None:
                 r = self._slots[1]['last_result']
                 return {
-                    'hip_center_y'    : r['hip_center_y'],
-                    'reference_length': r['reference_length'],
-                    'confidence'      : r['confidence'],
-                    'bbox'            : r['bbox'],
-                    'keypoints'       : r['keypoints'],
-                    'secondary_hip_y' : None,
-                    'secondary_bbox'  : None,
-                    'rel_dist'        : None,
-                    'is_dual'         : False,
+                    'hip_center_y'       : r['hip_center_y'],
+                    'reference_length'   : r['reference_length'],
+                    'confidence'         : r['confidence'],
+                    'bbox'               : r['bbox'],
+                    'keypoints'          : r['keypoints'],
+                    'secondary_hip_y'    : None,
+                    'secondary_bbox'     : None,
+                    'secondary_keypoints': None,
+                    'rel_dist'           : None,
+                    'is_dual'            : False,
                 }
             return empty
 
@@ -2141,12 +2334,14 @@ class YoloPoseTracker:
 
         sec_hip_y = None
         sec_bbox  = None
+        sec_kp    = None
         rel_dist  = None
         if self._dual_confirmed and len(self._slots) >= 2:
             sec = self._slots[1]
             if sec['last_result'] is not None:
                 sec_hip_y = sec['last_result'].get('hip_center_y')
                 sec_bbox  = sec['last_result'].get('bbox')
+                sec_kp    = sec['last_result'].get('keypoints')
                 if stable:
                     pri_hip_y = primary['last_result'].get('hip_center_y')
                     if sec_hip_y is not None and pri_hip_y is not None:
@@ -2154,15 +2349,16 @@ class YoloPoseTracker:
 
         r = primary['last_result']
         return {
-            'hip_center_y'    : r['hip_center_y'],
-            'reference_length': r['reference_length'],
-            'confidence'      : r['confidence'],
-            'bbox'            : r['bbox'],
-            'keypoints'       : r['keypoints'],
-            'secondary_hip_y' : sec_hip_y,
-            'secondary_bbox'  : sec_bbox,
-            'rel_dist'        : rel_dist,
-            'is_dual'         : (rel_dist is not None),
+            'hip_center_y'       : r['hip_center_y'],
+            'reference_length'   : r['reference_length'],
+            'confidence'         : r['confidence'],
+            'bbox'               : r['bbox'],
+            'keypoints'          : r['keypoints'],
+            'secondary_hip_y'    : sec_hip_y,
+            'secondary_bbox'     : sec_bbox,
+            'secondary_keypoints': sec_kp,
+            'rel_dist'           : rel_dist,
+            'is_dual'            : (rel_dist is not None),
         }
 
     def get_person_roi(self, frame_h: int, frame_w: int,
@@ -2178,16 +2374,97 @@ class YoloPoseTracker:
         y2r = min(1.0, (y2 + bh * margin) / frame_h)
         return (y1r, y2r, x1r, x2r)
 
+    # COCO face keypoint indices
+    NOSE       = 0
+    LEFT_EYE   = 1
+    RIGHT_EYE  = 2
+    LEFT_EAR   = 3
+    RIGHT_EAR  = 4
+
+    def detect_persons_stateless(self, frame_bgr: np.ndarray) -> list:
+        """슬롯/트래킹 상태를 변경하지 않고 순수 탐지만 수행.
+
+        Returns:
+            list of dict sorted by bbox_area desc (persons[0] = largest = P1):
+            {
+                'bbox': (x1,y1,x2,y2),
+                'keypoints': np.ndarray(17,3),  # [x,y,conf] pixel coords
+                'hip_px': (float,float) or None, # hip center pixel (x,y)
+                'face_cx': float or None,        # face center x pixel
+                'face_cy': float or None,        # face center y pixel
+                'confidence': float,
+                'bbox_area': float,
+            }
+        """
+        try:
+            results = self._model(frame_bgr, verbose=False, device=self._device)
+        except Exception:
+            return []
+
+        fh, fw = frame_bgr.shape[:2]
+        raw_persons = self._parse_all_persons(results, (fh, fw))
+
+        out = []
+        for p in raw_persons:
+            kp = p.get('keypoints')
+            bbox = p.get('bbox')
+            if bbox is None:
+                continue
+            bx1, by1, bx2, by2 = bbox
+            bbox_area = (bx2 - bx1) * (by2 - by1)
+
+            # Hip pixel center
+            hip_px = None
+            if kp is not None and kp.shape[0] > self.RIGHT_HIP:
+                lh, rh = kp[self.LEFT_HIP], kp[self.RIGHT_HIP]
+                valid = [v for v in [lh, rh] if v[2] >= self.MIN_KP_CONF]
+                if valid:
+                    xs = [v[0] for v in valid]
+                    ys = [v[1] for v in valid]
+                    hip_px = (float(np.mean(xs)), float(np.mean(ys)))
+
+            # Face center from nose/eyes/ears
+            face_cx, face_cy = None, None
+            if kp is not None and kp.shape[0] > self.RIGHT_EAR:
+                face_kps = [kp[i] for i in [self.NOSE, self.LEFT_EYE,
+                                             self.RIGHT_EYE, self.LEFT_EAR,
+                                             self.RIGHT_EAR]
+                            if kp[i][2] >= 0.20]
+                if face_kps:
+                    face_cx = float(np.mean([k[0] for k in face_kps]))
+                    face_cy = float(np.mean([k[1] for k in face_kps]))
+
+            out.append({
+                'bbox'      : bbox,
+                'keypoints' : kp,
+                'hip_px'    : hip_px,
+                'face_cx'   : face_cx,
+                'face_cy'   : face_cy,
+                'confidence': p.get('confidence', 0.0),
+                'bbox_area' : bbox_area,
+            })
+
+        # Sort by bbox_area descending: largest person = P1
+        out.sort(key=lambda x: x['bbox_area'], reverse=True)
+        return out
+
     def reset_tracking(self):
         """씬 전환 시 슬롯 상태 클리어 — 새 씬에서 처음부터 인물 재매칭."""
         for s in self._slots:
             s['last_result'] = None
             s['smoothed_hip_y'] = None
+            s['smoothed_shoulder_y'] = None
+            s['smoothed_knee_y'] = None
             s['hip_history'].clear()
             s['miss'] = self.MAX_MISS_FRAMES
             if s.get('hip_oef') is not None:
                 s['hip_oef'].reset()
+            if s.get('shoulder_oef') is not None:
+                s['shoulder_oef'].reset()
+            if s.get('knee_oef') is not None:
+                s['knee_oef'].reset()
         self._track_id_map.clear()  # 씬 전환 시 ID 재매핑 허용
+        self._p1_centroid_ema = None  # centroid EMA 리셋
         self._dual_confirmed = False
         self._dual_confirmed_at = 0
         self._frame_count = 0
@@ -2310,3 +2587,315 @@ class ContactPointTracker:
         self._prev_pts  = next_pts[good].reshape(-1, 1, 2)
         self._contact_y = new_y
         return new_y
+
+
+class SceneAnchorSelector:
+    """
+    씬 시작 N프레임 YOLO 샘플링 → P1/P2 골반 중심 픽셀 앵커 확정.
+    중앙값 집계로 이상치 제거, dual 탐지 신뢰도 평가.
+    """
+
+    LEFT_HIP  = 11
+    RIGHT_HIP = 12
+
+    def select(self, video_path: str, scene_start: int, scene_end: int,
+               yolo_tracker, n_samples: int = 10,
+               resize_w: int = RESIZE_WIDTH) -> dict:
+        """
+        반환 dict:
+        {
+            'p1_hip_px': (float, float) or None,   # (x, y) 픽셀
+            'p2_hip_px': (float, float) or None,   # (x, y) 픽셀
+            'frame_h': int,
+            'frame_w': int,
+            'is_dual': bool,
+            'confidence': float,   # 유효 샘플 비율 (0~1)
+        }
+        """
+        scene_len = max(scene_end - scene_start, 1)
+        step = max(1, scene_len // n_samples)
+        sample_frames = list(range(scene_start, scene_end, step))[:n_samples]
+
+        cap = cv2.VideoCapture(video_path)
+        frame_h, frame_w = 0, 0
+        p1_xs, p1_ys, p2_xs, p2_ys = [], [], [], []
+
+        for fi in sample_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            h_orig, w_orig = frame.shape[:2]
+            frame_resized = cv2.resize(
+                frame, (resize_w, int(h_orig * resize_w / w_orig))
+            )
+            frame_h, frame_w = frame_resized.shape[:2]
+
+            # detect_persons_stateless: 트래킹 warmup 없이 단일 프레임 탐지
+            # persons[0]=P1(largest bbox), persons[1]=P2 (if dual)
+            persons = yolo_tracker.detect_persons_stateless(frame_resized)
+
+            if len(persons) >= 1 and persons[0]['hip_px'] is not None:
+                hx, hy = persons[0]['hip_px']
+                p1_xs.append(hx)
+                p1_ys.append(hy)
+
+            if len(persons) >= 2:
+                p2 = persons[1]
+                # P2 크기 필터: P1 bbox_area의 25% 이상 (배경 소인 제거)
+                if p2['bbox_area'] >= persons[0]['bbox_area'] * 0.25:
+                    # P2 근접 필터: P1 bbox 2배 영역 안에 있어야 함
+                    p1_bbox = persons[0]['bbox']
+                    bw = p1_bbox[2] - p1_bbox[0]
+                    bh = p1_bbox[3] - p1_bbox[1]
+                    ex1 = p1_bbox[0] - bw; ex2 = p1_bbox[2] + bw
+                    ey1 = p1_bbox[1] - bh; ey2 = p1_bbox[3] + bh
+                    if p2['bbox'] is not None:
+                        p2cx = (p2['bbox'][0] + p2['bbox'][2]) / 2.0
+                        p2cy = (p2['bbox'][1] + p2['bbox'][3]) / 2.0
+                        if ex1 <= p2cx <= ex2 and ey1 <= p2cy <= ey2:
+                            if p2['hip_px'] is not None:
+                                hx2, hy2 = p2['hip_px']
+                                p2_xs.append(hx2)
+                                p2_ys.append(hy2)
+
+        cap.release()
+        # reset_tracking() 제거: 메인 트래커 상태를 오염시키지 않음
+
+        n_valid_p1 = len(p1_xs)
+        n_valid_p2 = len(p2_xs)
+        base_conf = min(n_valid_p1, n_valid_p2) / max(len(sample_frames), 1)
+
+        # 위치 일관성: y좌표 std가 높으면 앵커 불안정
+        if n_valid_p1 >= 3 and n_valid_p2 >= 3 and frame_h > 0:
+            consistency = 1.0 - min(
+                1.0,
+                max(float(np.std(p1_ys)), float(np.std(p2_ys))) / (frame_h * 0.15 + 1e-6)
+            )
+        else:
+            consistency = 1.0
+        confidence = base_conf * max(consistency, 0.0)
+
+        p1_hip_px = (
+            (self._robust_median(p1_xs), self._robust_median(p1_ys))
+            if n_valid_p1 >= 3 else None
+        )
+        p2_hip_px = (
+            (self._robust_median(p2_xs), self._robust_median(p2_ys))
+            if n_valid_p2 >= 3 else None
+        )
+
+        return {
+            'p1_hip_px' : p1_hip_px,
+            'p2_hip_px' : p2_hip_px,
+            'frame_h'   : frame_h,
+            'frame_w'   : frame_w,
+            'is_dual'   : (p1_hip_px is not None and p2_hip_px is not None),
+            'confidence': confidence,
+        }
+
+    @staticmethod
+    def _robust_median(values):
+        """IQR 기반 이상치 제거 후 중앙값."""
+        if len(values) < 3:
+            return float(np.median(values))
+        arr = np.array(values, dtype=np.float64)
+        q1, q3 = np.percentile(arr, [25, 75])
+        iqr = q3 - q1
+        filtered = arr[(arr >= q1 - 1.5 * iqr) & (arr <= q3 + 1.5 * iqr)]
+        return float(np.median(filtered)) if len(filtered) >= 2 else float(np.median(arr))
+
+
+class DualAnchorTracker:
+    """
+    P1 hip 앵커 + P2 hip 앵커를 LK 광학흐름으로 독립 추적.
+    두 점의 유클리드 거리 → 정규화 거리 (0~1, frame 대각선 기준) 반환.
+    추적 실패 or MAX_DRIFT 초과 → 재초기화 대기.
+    REINIT_FRAMES 마다 YOLO 키포인트로 앵커 재확인.
+    """
+
+    PATCH_SIZE    = 48
+    MIN_VALID_PTS = 3
+    MAX_DRIFT     = 0.30   # 초기화 이후 누적 최대 이동 (frame_diag 기준)
+    REINIT_FRAMES = 45     # YOLO 앵커 재확인 주기 (프레임)
+
+    LK_PARAMS = dict(
+        winSize=(19, 19),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03)
+    )
+    GFT_PARAMS = dict(
+        maxCorners=12,
+        qualityLevel=0.01,
+        minDistance=4,
+        blockSize=5
+    )
+
+    def __init__(self):
+        self._prev_gray    = None
+        self._pts1         = None
+        self._pts2         = None
+        self._anchor1      = None
+        self._anchor2      = None
+        self._anchor1_init = None
+        self._anchor2_init = None
+        self._frame_count  = 0
+        self._initialized  = False
+        self._frame_diag   = 1.0
+
+    def reset(self, p1_hip_px, p2_hip_px, frame_gray, frame_h, frame_w):
+        """앵커 초기화. p1_hip_px, p2_hip_px: (x, y) 픽셀 좌표."""
+        self._frame_diag  = float(np.sqrt(frame_h ** 2 + frame_w ** 2))
+        self._frame_count = 0
+        self._initialized = False
+
+        pts1 = self._init_anchor(frame_gray, p1_hip_px, frame_h, frame_w)
+        pts2 = self._init_anchor(frame_gray, p2_hip_px, frame_h, frame_w)
+
+        if pts1 is not None and pts2 is not None:
+            self._pts1 = pts1
+            self._pts2 = pts2
+            self._anchor1 = self._anchor1_init = (
+                float(np.median(pts1[:, 0, 0])),
+                float(np.median(pts1[:, 0, 1]))
+            )
+            self._anchor2 = self._anchor2_init = (
+                float(np.median(pts2[:, 0, 0])),
+                float(np.median(pts2[:, 0, 1]))
+            )
+            self._prev_gray   = frame_gray
+            self._initialized = True
+
+    def update(self, frame_gray, yolo_result=None, frame_h=None, frame_w=None):
+        """
+        반환: 정규화 거리 (0~1) or None
+        yolo_result: REINIT_FRAMES 마다 앵커 재확인에 사용
+        """
+        if not self._initialized or self._prev_gray is None:
+            return None
+
+        self._frame_count += 1
+
+        # REINIT_FRAMES 마다 YOLO로 앵커 재확인
+        if (self._frame_count % self.REINIT_FRAMES == 0
+                and yolo_result is not None
+                and frame_h is not None and frame_w is not None):
+            p1_px, p2_px = self._extract_hip_px(yolo_result)
+            if p1_px is not None and p2_px is not None:
+                self.reset(p1_px, p2_px, frame_gray, frame_h, frame_w)
+                return self._current_dist()
+
+        pts1_new = self._track_pts(self._prev_gray, frame_gray, self._pts1)
+        pts2_new = self._track_pts(self._prev_gray, frame_gray, self._pts2)
+
+        if pts1_new is None or pts2_new is None:
+            # LK 실패 → YOLO 즉시 복구 시도
+            if (yolo_result is not None
+                    and frame_h is not None and frame_w is not None
+                    and self._recover_from_yolo(yolo_result, frame_gray, frame_h, frame_w)):
+                return self._current_dist()
+            self._initialized = False
+            return None
+
+        a1 = (float(np.median(pts1_new[:, 0, 0])),
+               float(np.median(pts1_new[:, 0, 1])))
+        a2 = (float(np.median(pts2_new[:, 0, 0])),
+               float(np.median(pts2_new[:, 0, 1])))
+
+        # 과도한 drift 감지 → YOLO 복구 후 재초기화
+        if self._anchor1_init is not None and self._anchor2_init is not None:
+            drift1 = np.sqrt((a1[0] - self._anchor1_init[0]) ** 2
+                             + (a1[1] - self._anchor1_init[1]) ** 2)
+            drift2 = np.sqrt((a2[0] - self._anchor2_init[0]) ** 2
+                             + (a2[1] - self._anchor2_init[1]) ** 2)
+            if (drift1 / self._frame_diag > self.MAX_DRIFT or
+                    drift2 / self._frame_diag > self.MAX_DRIFT):
+                if (yolo_result is not None
+                        and frame_h is not None and frame_w is not None
+                        and self._recover_from_yolo(yolo_result, frame_gray, frame_h, frame_w)):
+                    return self._current_dist()
+                self._initialized = False
+                return None
+
+        self._pts1      = pts1_new
+        self._pts2      = pts2_new
+        self._anchor1   = a1
+        self._anchor2   = a2
+        self._prev_gray = frame_gray
+
+        return self._current_dist()
+
+    def get_anchor_pixels(self):
+        """디버그 오버레이용 현재 앵커 픽셀 반환."""
+        return self._anchor1, self._anchor2
+
+    # ── private ────────────────────────────────────────────────────────────
+
+    def _init_anchor(self, frame_gray, hip_px, frame_h, frame_w):
+        cx, cy = int(hip_px[0]), int(hip_px[1])
+        half = self.PATCH_SIZE // 2
+        x1 = max(0, cx - half)
+        x2 = min(frame_w, cx + half)
+        y1 = max(0, cy - half)
+        y2 = min(frame_h, cy + half)
+        patch = frame_gray[y1:y2, x1:x2]
+        if patch.size == 0:
+            return None
+        pts = cv2.goodFeaturesToTrack(patch, **self.GFT_PARAMS)
+        if pts is None or len(pts) < self.MIN_VALID_PTS:
+            return None
+        pts[:, 0, 0] += x1
+        pts[:, 0, 1] += y1
+        return pts
+
+    def _track_pts(self, prev_gray, cur_gray, pts):
+        if pts is None or len(pts) < self.MIN_VALID_PTS:
+            return None
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, cur_gray, pts, None, **self.LK_PARAMS
+        )
+        if next_pts is None:
+            return None
+        good = status.ravel() == 1
+        if good.sum() < self.MIN_VALID_PTS:
+            return None
+        return next_pts[good].reshape(-1, 1, 2)
+
+    def _current_dist(self):
+        if self._anchor1 is None or self._anchor2 is None:
+            return None
+        dx = self._anchor1[0] - self._anchor2[0]
+        dy = self._anchor1[1] - self._anchor2[1]
+        return float(np.sqrt(dx * dx + dy * dy)) / max(self._frame_diag, 1.0)
+
+    def _recover_from_yolo(self, yolo_result, frame_gray, frame_h, frame_w):
+        """
+        LK 추적 실패 / drift 초과 시 YOLO 키포인트로 앵커 즉시 복구.
+        마지막 앵커에서 frame_diag * 0.40 이내일 때만 복구 허용.
+        """
+        p1_px, p2_px = self._extract_hip_px(yolo_result)
+        if p1_px is None or p2_px is None:
+            return False
+        # 마지막 알려진 앵커와 너무 멀면 다른 사람일 가능성 → 거부
+        if self._anchor1 is not None:
+            dist1 = np.sqrt((p1_px[0] - self._anchor1[0]) ** 2
+                            + (p1_px[1] - self._anchor1[1]) ** 2)
+            if dist1 / self._frame_diag > 0.40:
+                return False
+        self.reset(p1_px, p2_px, frame_gray, frame_h, frame_w)
+        return self._initialized
+
+    def _extract_hip_px(self, yolo_result):
+        kp1 = yolo_result.get('keypoints')
+        kp2 = yolo_result.get('secondary_keypoints')
+        p1 = p2 = None
+        if kp1 is not None and len(kp1) > 12:
+            lh, rh = kp1[11], kp1[12]
+            if lh[2] > 0.30 and rh[2] > 0.30:
+                p1 = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
+        if kp2 is not None and len(kp2) > 12:
+            lh2, rh2 = kp2[11], kp2[12]
+            if lh2[2] > 0.30 and rh2[2] > 0.30:
+                p2 = ((lh2[0] + rh2[0]) / 2.0, (lh2[1] + rh2[1]) / 2.0)
+        return p1, p2

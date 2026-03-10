@@ -16,7 +16,10 @@ from algorithms import (
     MotionExtractor,
     SceneBoundaryHandler,
     YoloPoseTracker,
+    SceneTypeDetector,
     ContactPointTracker,
+    SceneAnchorSelector,
+    DualAnchorTracker,
     YOLO_AVAILABLE,
     DEVICE,
     RESIZE_WIDTH
@@ -32,14 +35,18 @@ MULTI_SCENE_THRESHOLD = 3
 
 def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detected,
                         frame_idx, fps, bbox=None, keypoints=None,
-                        secondary_hip_y=None, secondary_bbox=None, rel_dist=None):
+                        secondary_hip_y=None, secondary_bbox=None, rel_dist=None,
+                        secondary_keypoints=None, scene_type=None,
+                        anchor_p1=None, anchor_p2=None, anchor_dist=None):
     """
     ROI 박스 + velocity 방향 바 + zoom 상태를 프레임 위에 그려 JPEG base64로 반환.
     - ROI: 밝은 라임 그린 (#00FF80)
     - Velocity 바: 위=초록, 아래=주황 (프레임 오른쪽 끝)
     - ZOOM 배지: 빨강 (zoom 감지 시)
     - bbox: 인물 bbox (노란색, YOLO 탐지 시)
-    - keypoints: COCO 17 keypoints ndarray (hip 오렌지 원)
+    - keypoints: COCO 17 keypoints ndarray (P1 — 선명한 색상)
+    - secondary_keypoints: COCO 17 keypoints ndarray (P2 — 어두운 색상)
+    - scene_type: 장면 유형 문자열 (HIP_HIP/BJ/POV/OPTICAL_FLOW)
     """
     vis = frame_bgr.copy()
     h, w = vis.shape[:2]
@@ -91,8 +98,13 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
     # ── 전신 키포인트 오버레이 ──────────────────────────────────────────────
     if keypoints is not None and len(keypoints) >= 13:
         from algorithms import YoloPoseTracker as _YPT
-        # 키포인트별 색상: 어깨(녹), 골반(오렌지), 무릎(파랑), 발목(시안)
+        # 키포인트별 색상: 얼굴(흰/시안/황), 어깨(녹), 골반(오렌지), 무릎(파랑), 발목(시안)
         _KP_STYLE = {
+            0:  ((220, 220, 220), 'N',  3),   # nose (연회색)
+            1:  ((0,   220, 220), 'LE', 3),   # left_eye (시안)
+            2:  ((0,   220, 220), 'RE', 3),   # right_eye
+            3:  ((0,   180, 255), 'LA', 3),   # left_ear (하늘색)
+            4:  ((0,   180, 255), 'RA', 3),   # right_ear
             5:  ((80, 230, 80),  'LS', 4),   # left_shoulder
             6:  ((80, 230, 80),  'RS', 4),   # right_shoulder
             11: ((30, 120, 255), 'LH', 5),   # left_hip
@@ -118,8 +130,8 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
                 cv2.line(vis, (sx, hip_y_px), (min(sx + 4, w), hip_y_px),
                          (190, 190, 190), 1)
 
-        # 어깨-골반 연결선
-        _SKELETON = [(5, 11), (6, 12), (5, 6), (11, 12)]
+        # 스켈레톤 연결선 (얼굴-어깨 포함)
+        _SKELETON = [(0, 5), (0, 6), (5, 11), (6, 12), (5, 6), (11, 12)]
         for ka, kb in _SKELETON:
             if ka < len(keypoints) and kb < len(keypoints):
                 ax, ay, ac = keypoints[ka]
@@ -128,7 +140,36 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
                     cv2.line(vis, (int(ax), int(ay)), (int(bx), int(by)),
                              (120, 120, 120), 1)
 
-    # ── Secondary 인물 bbox (하늘색) + hip_y 수평선 ──
+    # ── P2 키포인트 오버레이 (채도 낮은 색상) ──────────────────────────────
+    if secondary_keypoints is not None and len(secondary_keypoints) >= 13:
+        _KP_STYLE_P2 = {
+            0:  ((130, 130, 130), 2),  # nose (어두운 회)
+            1:  ((0,  120, 120),  2),  # left_eye (어두운 시안)
+            2:  ((0,  120, 120),  2),  # right_eye
+            3:  ((0,   90, 150),  2),  # left_ear
+            4:  ((0,   90, 150),  2),  # right_ear
+            5:  ((40, 140, 40),  3),   # left_shoulder (어두운 녹)
+            6:  ((40, 140, 40),  3),   # right_shoulder
+            11: ((20, 60, 180),  4),   # left_hip (어두운 파랑)
+            12: ((20, 60, 180),  4),   # right_hip
+            13: ((110, 45, 20),  3),   # left_knee
+            14: ((110, 45, 20),  3),   # right_knee
+        }
+        for ki, (color, radius) in _KP_STYLE_P2.items():
+            if ki < len(secondary_keypoints):
+                kx, ky, kc = secondary_keypoints[ki]
+                if kc > 0.25:
+                    cv2.circle(vis, (int(kx), int(ky)), radius, color, -1)
+        # P2 어깨-골반 연결선
+        for ka, kb in [(5, 11), (6, 12)]:
+            if ka < len(secondary_keypoints) and kb < len(secondary_keypoints):
+                ax, ay, ac = secondary_keypoints[ka]
+                bx_, by_, bc = secondary_keypoints[kb]
+                if ac > 0.25 and bc > 0.25:
+                    cv2.line(vis, (int(ax), int(ay)), (int(bx_), int(by_)),
+                             (70, 70, 70), 1)
+
+    # ── Secondary 인물 bbox + hip_y 수평선 ──
     if secondary_bbox is not None:
         sbx1, sby1, sbx2, sby2 = (int(v) for v in secondary_bbox)
         cv2.rectangle(vis, (sbx1, sby1), (sbx2, sby2), (255, 200, 0), 1)
@@ -142,6 +183,27 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
     if rel_dist is not None:
         cv2.putText(vis, f"DUAL D:{rel_dist:.3f}", (4, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100, 255, 100), 1, cv2.LINE_AA)
+
+    # ── 장면 유형 표시 ──
+    if scene_type and scene_type != 'OPTICAL_FLOW':
+        _st_colors = {'HIP_HIP': (60, 200, 60), 'BJ': (60, 180, 255), 'POV': (200, 100, 255)}
+        _st_color = _st_colors.get(scene_type, (200, 200, 50))
+        cv2.putText(vis, f"MODE:{scene_type}", (4, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, _st_color, 1, cv2.LINE_AA)
+
+    # ── DualAnchor 시각화 ──
+    if anchor_p1 is not None:
+        cv2.circle(vis, (int(anchor_p1[0]), int(anchor_p1[1])), 6, (0, 80, 255), -1)
+        cv2.circle(vis, (int(anchor_p1[0]), int(anchor_p1[1])), 7, (0, 80, 255), 1)
+    if anchor_p2 is not None:
+        cv2.circle(vis, (int(anchor_p2[0]), int(anchor_p2[1])), 6, (255, 120, 0), -1)
+        cv2.circle(vis, (int(anchor_p2[0]), int(anchor_p2[1])), 7, (255, 120, 0), 1)
+    if anchor_p1 is not None and anchor_p2 is not None:
+        cv2.line(vis, (int(anchor_p1[0]), int(anchor_p1[1])),
+                 (int(anchor_p2[0]), int(anchor_p2[1])), (60, 220, 120), 1)
+    if anchor_dist is not None:
+        cv2.putText(vis, f"ANC D:{anchor_dist:.3f}", (4, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 220, 120), 1, cv2.LINE_AA)
 
     # ── 시간 레이블 ──
     t_sec = frame_idx / max(fps, 1.0)
@@ -451,6 +513,31 @@ def _estimate_dual_scale(flow_vel: np.ndarray, dual_vel: np.ndarray,
     return float(np.median(flow_abs / dual_abs))
 
 
+def _compute_bj_dist(yolo_result: dict, frame_h: int):
+    """
+    P1 head(nose=0, left_eye=1, right_eye=2, left_ear=3, right_ear=4) ↔ P2 hip 정규화 거리.
+    BJ 신호 계산용: 거리 감소 → 더 깊게 → velocity 양수.
+    반환: 0~1 정규화 거리 (frame_h 기준) or None
+    """
+    kp1 = yolo_result.get('keypoints')
+    p2_hip_y = yolo_result.get('secondary_hip_y')
+
+    if kp1 is None or p2_hip_y is None:
+        return None
+
+    # P1 head: nose → left_eye → right_eye → left_ear → right_ear 순으로 첫 유효 키포인트
+    head_y = None
+    for ki in [0, 1, 2, 3, 4]:
+        if ki < len(kp1) and kp1[ki][2] > 0.20:
+            head_y = kp1[ki][1] / frame_h   # 정규화 (0~1)
+            break
+
+    if head_y is None:
+        return None
+
+    return abs(head_y - p2_hip_y)   # 정규화 거리 (0~1)
+
+
 def _blend_dual_pose(velocity_flow: np.ndarray,
                      rel_dists: list,
                      yolo_is_duals: list,
@@ -505,6 +592,110 @@ def _blend_dual_pose(velocity_flow: np.ndarray,
     for i in range(n):
         if dual_mask[i] and not np.isnan(dual_vel[i]):
             blended[i] = dual_vel[i] * scale
+
+    return blended
+
+
+def _blend_bj_pose(velocity_flow: np.ndarray,
+                   head_hip_dists: list,
+                   bj_mask: np.ndarray,
+                   rolling_window: int = 120) -> np.ndarray:
+    """
+    P1 head ↔ P2 hip 거리 미분 → velocity.
+    거리 감소(가까워짐) → 음수 delta → velocity 양수(stroke in).
+    BJ 구간 15% 미만이면 velocity_flow 그대로 반환.
+    """
+    n = len(velocity_flow)
+    if bj_mask.sum() < n * 0.15:
+        return velocity_flow
+
+    dist_arr = np.array([d if d is not None else np.nan for d in head_hip_dists],
+                        dtype=np.float64)
+
+    # rolling min/max 정규화 (씬별 독립 진폭)
+    roll_min = np.full(n, np.nan)
+    roll_max = np.full(n, np.nan)
+    for i in range(n):
+        w_start = max(0, i - rolling_window + 1)
+        window = dist_arr[w_start:i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) >= 5:
+            roll_min[i] = valid.min()
+            roll_max[i] = valid.max()
+
+    roll_range = roll_max - roll_min
+    roll_range = np.where(
+        np.isnan(roll_range) | (roll_range < 0.01), 0.01, roll_range
+    )
+
+    # 미분: 거리 감소 → 양수 velocity
+    bj_vel = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        if np.isnan(dist_arr[i]) or np.isnan(dist_arr[i - 1]):
+            continue
+        bj_vel[i] = -(dist_arr[i] - dist_arr[i - 1]) / roll_range[i]
+
+    # flow 스케일 맞추기 (_estimate_dual_scale 재사용)
+    scale = _estimate_dual_scale(velocity_flow, bj_vel, bj_mask)
+    if scale is None or scale <= 0:
+        return velocity_flow
+
+    blended = velocity_flow.copy()
+    for i in range(n):
+        if bj_mask[i] and not np.isnan(bj_vel[i]):
+            blended[i] = bj_vel[i] * scale
+
+    return blended
+
+
+def _blend_anchor_dist(velocity_flow: np.ndarray,
+                       anchor_dists: list,
+                       rolling_window: int = 120) -> np.ndarray:
+    """
+    DualAnchorTracker 거리 미분 → velocity.
+    거리 감소(가까워짐) → 양수 velocity(stroke in).
+    유효 프레임 30% 미만이면 velocity_flow 반환.
+    """
+    n = len(velocity_flow)
+    valid_mask = np.array([d is not None for d in anchor_dists], dtype=bool)
+
+    if valid_mask.sum() < n * 0.30:
+        return velocity_flow
+
+    dist_arr = np.array([d if d is not None else np.nan for d in anchor_dists],
+                        dtype=np.float64)
+
+    # rolling min/max 정규화
+    roll_min = np.full(n, np.nan)
+    roll_max = np.full(n, np.nan)
+    for i in range(n):
+        w_start = max(0, i - rolling_window + 1)
+        window = dist_arr[w_start:i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) >= 5:
+            roll_min[i] = valid.min()
+            roll_max[i] = valid.max()
+
+    roll_range = roll_max - roll_min
+    roll_range = np.where(
+        np.isnan(roll_range) | (roll_range < 0.005), 0.005, roll_range
+    )
+
+    # 미분: 거리 감소 → 양수 velocity
+    anchor_vel = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        if np.isnan(dist_arr[i]) or np.isnan(dist_arr[i - 1]):
+            continue
+        anchor_vel[i] = -(dist_arr[i] - dist_arr[i - 1]) / roll_range[i]
+
+    scale = _estimate_dual_scale(velocity_flow, anchor_vel, valid_mask)
+    if scale is None or scale <= 0:
+        return velocity_flow
+
+    blended = velocity_flow.copy()
+    for i in range(n):
+        if valid_mask[i] and not np.isnan(anchor_vel[i]):
+            blended[i] = anchor_vel[i] * scale
 
     return blended
 
@@ -583,6 +774,14 @@ def _get_roi_for_frame(frame_idx, scene_boundaries, per_scene_rois):
     return per_scene_rois[-1] if per_scene_rois else (0.15, 0.85, 0.15, 0.85)
 
 
+def _get_scene_index(frame_idx, scene_boundaries):
+    """frame_idx가 속한 씬의 인덱스 반환. 해당 없으면 마지막 씬 인덱스."""
+    for i, (start, end) in enumerate(scene_boundaries):
+        if start <= frame_idx < end:
+            return i
+    return len(scene_boundaries) - 1
+
+
 def run_analysis(video_path, progress_callback=None, frame_callback=None):
     """
     Two-pass funscript generation pipeline with per-scene adaptive ROI.
@@ -654,6 +853,9 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
             yolo_tracker = None
             print(f"YoloPoseTracker init failed (skipping): {e}")
 
+    # SceneTypeDetector — yolo_tracker 유무와 무관하게 초기화
+    scene_detector = SceneTypeDetector(fps=fps)
+
     # ── Phase 2: ROI Detection (strategy depends on video type) ──
     if progress_callback:
         progress_callback(5, 100, "Detecting ROI...")
@@ -663,7 +865,10 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
 
     # Always use per-scene ROI regardless of video_type
     # (global ROI across many scenes causes full-frame [0-1,0-1] detection failure)
-    per_scene_rois = []
+    per_scene_rois    = []
+    per_scene_anchors = []
+    anchor_selector   = SceneAnchorSelector() if yolo_tracker is not None else None
+
     for i, (scene_start, scene_end) in enumerate(scene_boundaries):
         scene_length = scene_end - scene_start
         scene_sample_count = min(40, max(10, scene_length // 5))
@@ -673,6 +878,18 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
         per_scene_rois.append(roi)
         print(f"  Scene {i+1} [{scene_start}-{scene_end}]: "
               f"ROI y=[{roi[0]:.2f}-{roi[1]:.2f}], x=[{roi[2]:.2f}-{roi[3]:.2f}]")
+
+        # 씬별 dual 앵커 선정
+        if anchor_selector is not None:
+            anchor = anchor_selector.select(
+                video_path, scene_start, scene_end, yolo_tracker, n_samples=10
+            )
+            per_scene_anchors.append(anchor)
+            print(f"  Scene {i+1} anchor: dual={anchor['is_dual']}, "
+                  f"conf={anchor['confidence']:.2f}")
+        else:
+            per_scene_anchors.append(None)
+
     roi_strategy = "per_scene"
 
     if progress_callback:
@@ -720,7 +937,12 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
     yolo_is_duals  = []   # dual: 해당 프레임 dual 모드 여부
     quality_records = []  # 프레임별 품질 메타데이터
     contact_ys     = []   # LK 접촉점 y (정규화 0~1, None=추적실패)
-    contact_tracker = ContactPointTracker()
+    scene_types    = []   # 프레임별 SceneTypeDetector 결과
+    head_hip_dists = []   # 프레임별 P1 head ↔ P2 hip 정규화 거리 (or None)
+    anchor_dists   = []   # 프레임별 DualAnchorTracker 거리 (float|None)
+    contact_tracker    = ContactPointTracker()
+    anchor_tracker     = DualAnchorTracker()
+    anchor_initialized = False
 
     for i in range(total_frames - 1):
         ret, frame = cap.read()
@@ -738,7 +960,9 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
             roi_tracker.reset(new_scene_roi)
             if yolo_tracker is not None:
                 yolo_tracker.reset_tracking()
+            scene_detector.reset()
             contact_tracker.reset()
+            anchor_initialized = False
 
         flow = flow_estimator.estimate_flow(prev_frame, frame_resized)
         current_roi = roi_tracker.update(flow, frame_h, frame_w)
@@ -754,15 +978,27 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
         yolo_result = {'hip_center_y': None, 'reference_length': None,
                        'confidence': 0.0, 'bbox': None, 'keypoints': None,
                        'secondary_hip_y': None, 'secondary_bbox': None,
+                       'secondary_keypoints': None,
                        'rel_dist': None, 'is_dual': False}
         if yolo_tracker is not None:
             yolo_result = yolo_tracker.process_frame(frame_resized,
                                                       roi_fractions=current_roi)
+
+        # ── 장면 유형 감지 ──
+        scene_type = scene_detector.update(
+            p1_kp=yolo_result.get('keypoints'),
+            p2_kp=yolo_result.get('secondary_keypoints'),
+            p2_hip_y=yolo_result.get('secondary_hip_y'),
+            frame_h=frame_h,
+        )
+
         yolo_hip_ys.append(yolo_result['hip_center_y'])
         yolo_ref_lens.append(yolo_result['reference_length'])
         yolo_confs.append(yolo_result['confidence'])
         yolo_rel_dists.append(yolo_result.get('rel_dist'))
         yolo_is_duals.append(yolo_result.get('is_dual', False))
+        scene_types.append(scene_type)
+        head_hip_dists.append(_compute_bj_dist(yolo_result, frame_h))
         quality_records.append({
             'conf'         : yolo_result.get('confidence', 0.0),
             'is_dual'      : yolo_result.get('is_dual', False),
@@ -778,6 +1014,28 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
         contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w)
         contact_ys.append(contact_y)
 
+        # ── DualAnchorTracker (LK 두 점 독립 추적) ──
+        if not anchor_initialized:
+            si = _get_scene_index(i, scene_boundaries)
+            anchor_info = per_scene_anchors[si] if si < len(per_scene_anchors) else None
+            if (anchor_info and anchor_info['is_dual']
+                    and anchor_info['frame_h'] > 0 and anchor_info['frame_w'] > 0):
+                scale_y = frame_h / anchor_info['frame_h']
+                scale_x = frame_w / anchor_info['frame_w']
+                p1_scaled = (anchor_info['p1_hip_px'][0] * scale_x,
+                             anchor_info['p1_hip_px'][1] * scale_y)
+                p2_scaled = (anchor_info['p2_hip_px'][0] * scale_x,
+                             anchor_info['p2_hip_px'][1] * scale_y)
+                anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w)
+                anchor_initialized = True
+
+        anchor_dist = None
+        if anchor_initialized:
+            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w)
+            if anchor_dist is None:
+                anchor_initialized = False
+        anchor_dists.append(anchor_dist)
+
         prev_frame = frame_resized
 
         if i % 5 == 0:
@@ -785,6 +1043,7 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
             if progress_callback:
                 progress_callback(pct, 100, f"Extracting motion... ({i+1}/{total_frames})")
             if frame_callback:
+                _anc1, _anc2 = anchor_tracker.get_anchor_pixels() if anchor_initialized else (None, None)
                 b64 = _draw_debug_overlay(
                     frame_resized, current_roi, velocity, magnitude,
                     zoom_detected, i + 1, fps,
@@ -793,6 +1052,11 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
                     secondary_hip_y=yolo_result.get('secondary_hip_y'),
                     secondary_bbox=yolo_result.get('secondary_bbox'),
                     rel_dist=yolo_result.get('rel_dist'),
+                    secondary_keypoints=yolo_result.get('secondary_keypoints'),
+                    scene_type=scene_type,
+                    anchor_p1=_anc1,
+                    anchor_p2=_anc2,
+                    anchor_dist=anchor_dist,
                 )
                 frame_callback(b64, {
                     'type': 'frame',
@@ -828,10 +1092,27 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
                         if contact_ys else 0.0)
     print(f"LK contact tracking coverage: {contact_coverage:.1%}")
 
+    # scene_type 배열 → BJ 마스크 생성
+    st_arr  = np.array(scene_types) if scene_types else np.array([])
+    bj_mask = (st_arr == 'BJ')
+    bj_coverage = float(bj_mask.sum()) / max(len(st_arr), 1)
+    print(f"Scene coverage — BJ: {bj_coverage:.1%}")
+
+    anchor_coverage = (sum(1 for d in anchor_dists if d is not None) / max(len(anchor_dists), 1)
+                       if anchor_dists else 0.0)
+    print(f"Dual anchor tracking coverage: {anchor_coverage:.1%}")
+
     if (contact_coverage >= 0.40 and len(contact_ys) == len(velocity_signal)
             and dual_coverage >= 0.30):
         velocity_signal = _blend_contact_tracking(velocity_signal, contact_ys, yolo_is_duals)
         print("Using LK contact point tracking signal")
+    elif (anchor_coverage >= 0.30 and len(anchor_dists) == len(velocity_signal)):
+        velocity_signal = _blend_anchor_dist(velocity_signal, anchor_dists)
+        print(f"Using dual-anchor LK distance signal ({anchor_coverage:.1%} coverage)")
+    elif (bj_coverage >= 0.25 and len(head_hip_dists) == len(velocity_signal)
+          and len(st_arr) == len(velocity_signal)):
+        velocity_signal = _blend_bj_pose(velocity_signal, head_hip_dists, bj_mask)
+        print(f"Using BJ head-hip distance signal ({bj_coverage:.1%} coverage)")
     elif dual_coverage >= 0.50 and len(yolo_rel_dists) == len(velocity_signal):
         velocity_signal = _blend_dual_pose(velocity_signal, yolo_rel_dists, yolo_is_duals)
         print("Using dual-person relative distance signal")
