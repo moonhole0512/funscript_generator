@@ -2,7 +2,8 @@ import asyncio
 import flet as ft
 import os
 import threading
-from main import run_analysis
+import traceback
+from main import run_analysis, pass1_analyze, pass2_extract, UserConfig
 
 # flet-dropzone requires `flet build windows` (VS2022 + Flutter SDK) to work.
 HAS_DROPZONE = False
@@ -18,6 +19,7 @@ class QueueItem:
     """Represents a video in the processing queue."""
     PENDING = "pending"
     PROCESSING = "processing"
+    AWAITING_INPUT = "awaiting_input"
     COMPLETE = "complete"
     ERROR = "error"
 
@@ -34,16 +36,21 @@ class QueueItem:
         self.preview_b64 = None        # base64 JPEG: current frame with overlays
         self.preview_info = {}         # {'velocity', 'magnitude', 'zoom', 'frame', 'total'}
         self.result_graph_b64 = None   # base64 PNG: position signal + action points
+        # Interactive preprocessing (Pass 1.5)
+        self.pass1_result = None       # Pass1Result returned by pass1_analyze()
+        self.user_config = None        # UserConfig set by UI before pass2 starts
+        self._input_event = None       # threading.Event: set() when user clicks "Start Processing"
 
 
 class ProcessingQueue:
     """Manages a queue of videos to process sequentially."""
 
-    def __init__(self, on_update=None, on_frame=None):
+    def __init__(self, on_update=None, on_frame=None, on_awaiting_input=None):
         self.items = []
         self.is_processing = False
         self.on_update = on_update
-        self.on_frame = on_frame   # called with (item) when preview frame arrives
+        self.on_frame = on_frame                   # called with (item) when preview frame arrives
+        self.on_awaiting_input = on_awaiting_input  # called with (item) when Pass 1 done, waiting for user
         self._lock = threading.Lock()
 
     def add(self, video_path):
@@ -60,7 +67,8 @@ class ProcessingQueue:
     def remove(self, index):
         with self._lock:
             if 0 <= index < len(self.items):
-                if self.items[index].status != QueueItem.PROCESSING:
+                item = self.items[index]
+                if item.status not in (QueueItem.PROCESSING, QueueItem.AWAITING_INPUT):
                     self.items.pop(index)
         self._notify()
 
@@ -117,8 +125,40 @@ class ProcessingQueue:
                     pass
 
         try:
-            success = run_analysis(
-                item.video_path,
+            # ── Pass 1: Scene detection + per-scene person detection ──────
+            r = pass1_analyze(item.video_path, progress_callback=progress_callback)
+            if r is None:
+                item.status = QueueItem.ERROR
+                item.error_message = "Pass 1 (scene detection) failed"
+                with self._lock:
+                    self.is_processing = False
+                self._notify()
+                self._try_process_next()
+                return
+
+            # ── Pause: wait for user to configure scenes ──────────────────
+            item.pass1_result = r
+            item.user_config = UserConfig.auto_from_pass1(r)  # default: all enabled
+            item._input_event = threading.Event()
+            item.status = QueueItem.AWAITING_INPUT
+            item.progress_text = "Configure scenes then click Start"
+            self._notify()
+            if self.on_awaiting_input:
+                try:
+                    self.on_awaiting_input(item)
+                except Exception:
+                    pass
+
+            item._input_event.wait()  # blocks until UI calls event.set()
+
+            # ── Pass 2: Motion extraction with user config ─────────────────
+            item.status = QueueItem.PROCESSING
+            item.progress = 0.0
+            item.progress_text = "Pass 2: Extracting motion..."
+            self._notify()
+
+            success = pass2_extract(
+                item.video_path, r, item.user_config,
                 progress_callback=progress_callback,
                 frame_callback=frame_callback,
             )
@@ -132,6 +172,7 @@ class ProcessingQueue:
                 item.status = QueueItem.ERROR
                 item.error_message = "Processing failed"
         except Exception as e:
+            traceback.print_exc()  # Print full error to terminal
             item.status = QueueItem.ERROR
             item.error_message = str(e)
 
@@ -312,6 +353,13 @@ async def main(page: ft.Page):
             icon = ft.Icon(ft.Icons.HOURGLASS_EMPTY, color=ft.Colors.GREY_500, size=20)
             status_widget = ft.Text("Waiting", size=12, color=ft.Colors.GREY_500, width=90)
             progress_widget = ft.Container()
+        elif item.status == QueueItem.AWAITING_INPUT:
+            icon = ft.Icon(ft.Icons.TUNE, color=ft.Colors.ORANGE_ACCENT, size=20)
+            status_widget = ft.TextButton(
+                "Configure...", style=ft.ButtonStyle(color=ft.Colors.ORANGE_ACCENT),
+                on_click=lambda e, it=item: show_preprocessing_dialog(it),
+            )
+            progress_widget = ft.Container()
         elif item.status == QueueItem.PROCESSING:
             icon = ft.Icon(ft.Icons.PLAY_CIRCLE_FILL, color=ft.Colors.CYAN_ACCENT, size=20)
             pct = int(item.progress * 100)
@@ -337,14 +385,14 @@ async def main(page: ft.Page):
             ft.Icons.CLOSE, icon_size=16, icon_color=ft.Colors.GREY_600,
             tooltip="Remove",
             on_click=lambda e, i=idx: remove_item(i),
-            visible=item.status != QueueItem.PROCESSING,
+            visible=item.status not in (QueueItem.PROCESSING, QueueItem.AWAITING_INPUT),
         )
 
         # Progress text (below file name)
         prog_text = ft.Text(
             item.progress_text, size=11, color=ft.Colors.GREY_600,
             overflow=ft.TextOverflow.ELLIPSIS,
-            visible=bool(item.progress_text and item.status == QueueItem.PROCESSING),
+            visible=bool(item.progress_text and item.status in (QueueItem.PROCESSING, QueueItem.AWAITING_INPUT)),
         )
 
         if item.video_type == "single_scene":
@@ -464,11 +512,14 @@ async def main(page: ft.Page):
 
         pending = sum(1 for i in queue.items if i.status == QueueItem.PENDING)
         processing = sum(1 for i in queue.items if i.status == QueueItem.PROCESSING)
+        awaiting = sum(1 for i in queue.items if i.status == QueueItem.AWAITING_INPUT)
         complete = sum(1 for i in queue.items if i.status == QueueItem.COMPLETE)
 
         parts = []
         if processing:
             parts.append(f"{processing} processing")
+        if awaiting:
+            parts.append(f"{awaiting} awaiting input")
         if pending:
             parts.append(f"{pending} waiting")
         if complete:
@@ -487,7 +538,411 @@ async def main(page: ft.Page):
         _update_preview_panel(item)
         _schedule_update()
 
-    queue = ProcessingQueue(on_update=rebuild_queue_ui, on_frame=on_frame_update)
+    # ── Preprocessing Dialog (F3/F1/F2 tabs) ─────────────────────────────
+    _RESIZE_W = 512   # algorithms.RESIZE_WIDTH — preview frames are this wide
+    _DISP_W   = 460   # dialog preview display width
+    _DISP_H   = int(_DISP_W * 9 / 16)  # 16:9 display height
+    _FSCALE   = _RESIZE_W / _DISP_W    # display→frame coordinate scale
+
+    def show_preprocessing_dialog(item):
+        """Build and open the 3-tab scene configuration dialog (F3 / F1 / F2)."""
+        r = item.pass1_result
+        cfg = item.user_config
+        if r is None or cfg is None:
+            return
+
+        fps = r.fps or 30.0
+        n_sc = len(r.scene_boundaries)
+        all_persons = r.per_scene_persons or []
+        all_previews = r.per_scene_previews or []
+
+        # ── Helper: build thumbnail for a scene ───────────────────────────
+        def _thumb(i, w=96, h=54):
+            b64 = all_previews[i] if i < len(all_previews) else None
+            if b64:
+                return ft.Image(src=f"data:image/jpeg;base64,{b64}",
+                                width=w, height=h, fit=ft.BoxFit.CONTAIN, border_radius=4)
+            return ft.Container(width=w, height=h, bgcolor=ft.Colors.GREY_800, border_radius=4,
+                                alignment=ft.Alignment(0, 0),
+                                content=ft.Icon(ft.Icons.IMAGE_NOT_SUPPORTED,
+                                                color=ft.Colors.GREY_600, size=16))
+
+        # ══════════════════════════════════════════════════════════════════
+        # Tab 1 — F3: Scene ON/OFF
+        # ══════════════════════════════════════════════════════════════════
+        toggles = []
+        scene_rows = []
+        for i, (bounds, sc) in enumerate(zip(r.scene_boundaries, cfg.scene_configs)):
+            start_s = bounds[0] / fps
+            end_s   = bounds[1] / fps
+            n_p = len(all_persons[i]) if i < len(all_persons) else 0
+
+            sw = ft.Switch(value=sc.enabled, active_color=ft.Colors.CYAN_ACCENT, scale=0.8)
+            toggles.append(sw)
+
+            badge = ft.Container(
+                content=ft.Text(f"{n_p}P", size=10, color=ft.Colors.WHITE,
+                                weight=ft.FontWeight.BOLD),
+                bgcolor=ft.Colors.TEAL_700 if n_p >= 2 else ft.Colors.GREY_700,
+                border_radius=4, padding=ft.Padding.symmetric(horizontal=4, vertical=2),
+            )
+            scene_rows.append(ft.Container(
+                content=ft.Row(
+                    [sw, _thumb(i), ft.Column([
+                        ft.Text(f"Scene {i + 1}", size=13, weight=ft.FontWeight.W_500),
+                        ft.Text(f"{start_s:.1f}s – {end_s:.1f}s  ({end_s - start_s:.1f}s)",
+                                size=11, color=ft.Colors.GREY_500),
+                        badge,
+                    ], spacing=2)],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=10,
+                ),
+                padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+                border_radius=6, bgcolor=ft.Colors.with_opacity(0.05, ft.Colors.WHITE),
+            ))
+
+        def _f3_all_on(e):
+            for sw in toggles:
+                sw.value = True
+            _schedule_update()
+
+        def _f3_yolo_only(e):
+            for i2, sw in enumerate(toggles):
+                n = len(all_persons[i2]) if i2 < len(all_persons) else 0
+                sw.value = (n >= 1)
+            _schedule_update()
+
+        f3_content = ft.Column([
+            ft.Text("씬 ON/OFF로 funscript 생성 구간을 선택하세요.",
+                    size=11, color=ft.Colors.GREY_400),
+            ft.Row([
+                ft.TextButton("All ON", on_click=_f3_all_on,
+                              style=ft.ButtonStyle(color=ft.Colors.CYAN_ACCENT)),
+                ft.TextButton("YOLO scenes only", on_click=_f3_yolo_only,
+                              style=ft.ButtonStyle(color=ft.Colors.TEAL_ACCENT)),
+            ], spacing=4),
+            ft.Divider(height=1, color=ft.Colors.GREY_800),
+            ft.Column(scene_rows, spacing=4, scroll=ft.ScrollMode.AUTO, height=360),
+        ], spacing=8)
+
+        # ══════════════════════════════════════════════════════════════════
+        # Tab 2 — Per-scene person selection (P1/P2 dropdown)
+        # ══════════════════════════════════════════════════════════════════
+        f1_idx = [0]
+        # Use transparent 1x1 pixel gif as dummy src to prevent 'A valid src value must be specified'
+        dummy_src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        f1_img      = ft.Image(src=dummy_src, width=_DISP_W, height=_DISP_H, fit=ft.BoxFit.CONTAIN,
+                               visible=False)
+        f1_no_prev  = ft.Container(width=_DISP_W, height=_DISP_H, bgcolor=ft.Colors.GREY_900,
+                                   border_radius=8, alignment=ft.Alignment(0, 0),
+                                   content=ft.Text("No preview", color=ft.Colors.GREY_700))
+        f1_lbl      = ft.Text("", size=13, weight=ft.FontWeight.W_500)
+        f1_cnt      = ft.Text("", size=11, color=ft.Colors.GREY_500)
+        f1_p1_dd    = ft.Dropdown(label="P1 (Primary)", width=200, dense=True)
+        f1_p2_dd    = ft.Dropdown(label="P2 (Secondary)", width=200, dense=True)
+
+        def _f1_refresh():
+            i = f1_idx[0]
+            persons = all_persons[i] if i < len(all_persons) else []
+            b64     = all_previews[i] if i < len(all_previews) else None
+            sc      = cfg.scene_configs[i]
+
+            f1_lbl.value = f"Scene {i + 1} / {n_sc}"
+            f1_cnt.value = f"{len(persons)} person(s) detected"
+
+            if b64:
+                f1_img.src     = f"data:image/jpeg;base64,{b64}"
+                f1_img.visible = True
+                f1_no_prev.visible = False
+            else:
+                f1_img.visible = False
+                f1_no_prev.visible = True
+
+            p_opts = [ft.dropdown.Option(str(j), f"Person {j + 1}")
+                      for j in range(len(persons))]
+            if not p_opts:
+                p_opts = [ft.dropdown.Option("0", "(none detected)")]
+            f1_p1_dd.options = p_opts
+            f1_p1_dd.value   = str(sc.p1_person_idx) if sc.p1_person_idx < len(persons) else "0"
+
+            p2_opts = [ft.dropdown.Option("-1", "None (single person)")] + [
+                ft.dropdown.Option(str(j), f"Person {j + 1}") for j in range(len(persons))
+            ]
+            f1_p2_dd.options = p2_opts
+            f1_p2_dd.value   = (str(sc.p2_person_idx)
+                                 if 0 <= sc.p2_person_idx < len(persons) else "-1")
+            page.update()
+
+        def _f1_prev(e):
+            f1_idx[0] = max(0, f1_idx[0] - 1)
+            _f1_refresh()
+
+        def _f1_next(e):
+            f1_idx[0] = min(n_sc - 1, f1_idx[0] + 1)
+            _f1_refresh()
+
+        def _f1_p1_changed(e):
+            try:
+                cfg.scene_configs[f1_idx[0]].p1_person_idx = int(e.control.value)
+            except (ValueError, IndexError):
+                pass
+
+        def _f1_p2_changed(e):
+            try:
+                cfg.scene_configs[f1_idx[0]].p2_person_idx = int(e.control.value)
+            except (ValueError, IndexError):
+                pass
+
+        def _f1_apply_all(e):
+            src = cfg.scene_configs[f1_idx[0]]
+            for sc2 in cfg.scene_configs:
+                sc2.p1_person_idx = src.p1_person_idx
+                sc2.p2_person_idx = src.p2_person_idx
+
+        f1_p1_dd.on_change = _f1_p1_changed
+        f1_p2_dd.on_change = _f1_p2_changed
+
+        f1_content = ft.Column([
+            ft.Text("씬별 P1(기준 인물)/P2(상대) 인물을 선택하세요. 엑스트라를 제외할 수 있습니다.",
+                    size=11, color=ft.Colors.GREY_400),
+            ft.Row([
+                ft.IconButton(ft.Icons.CHEVRON_LEFT, icon_color=ft.Colors.GREY_400,
+                              on_click=_f1_prev, tooltip="Previous scene"),
+                f1_lbl,
+                ft.IconButton(ft.Icons.CHEVRON_RIGHT, icon_color=ft.Colors.GREY_400,
+                              on_click=_f1_next, tooltip="Next scene"),
+                ft.Container(expand=True),
+                f1_cnt,
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Stack([f1_no_prev, f1_img]),
+            ft.Row([f1_p1_dd, f1_p2_dd], spacing=12),
+            ft.TextButton("Apply this P1/P2 to ALL scenes",
+                          on_click=_f1_apply_all,
+                          style=ft.ButtonStyle(color=ft.Colors.AMBER_ACCENT)),
+        ], spacing=8)
+
+        # ══════════════════════════════════════════════════════════════════
+        # Tab 3 — Manual hip pixel click input
+        # ══════════════════════════════════════════════════════════════════
+        f2_idx  = [0]
+        f2_mode = ['p1']  # 'p1' | 'p2' | 'clear'
+
+        f2_img      = ft.Image(src=dummy_src, width=_DISP_W, height=_DISP_H, fit=ft.BoxFit.CONTAIN)
+        f2_no_prev  = ft.Container(width=_DISP_W, height=_DISP_H, bgcolor=ft.Colors.GREY_900,
+                                   border_radius=8, alignment=ft.Alignment(0, 0),
+                                   content=ft.Text("No preview", color=ft.Colors.GREY_700))
+        f2_p1_dot   = ft.Container(width=14, height=14, bgcolor=ft.Colors.RED_ACCENT,
+                                   border_radius=7, visible=False, left=0, top=0)
+        f2_p2_dot   = ft.Container(width=14, height=14, bgcolor=ft.Colors.BLUE_ACCENT,
+                                   border_radius=7, visible=False, left=0, top=0)
+        f2_lbl      = ft.Text("", size=13, weight=ft.FontWeight.W_500)
+        f2_note     = ft.Text("", size=11, color=ft.Colors.GREY_500)
+        f2_coords   = ft.Text("", size=11, color=ft.Colors.GREY_400, font_family="monospace")
+        f2_p1_btn   = ft.Button("P1 Hip",  bgcolor=ft.Colors.RED_900,
+                                color=ft.Colors.WHITE, height=30)
+        f2_p2_btn   = ft.Button("P2 Hip",  bgcolor=ft.Colors.GREY_800,
+                                color=ft.Colors.WHITE, height=30)
+        f2_clr_btn  = ft.Button("Clear",   bgcolor=ft.Colors.GREY_800,
+                                color=ft.Colors.WHITE, height=30)
+
+        def _f2_update_btns():
+            m = f2_mode[0]
+            f2_p1_btn.bgcolor  = ft.Colors.RED_900  if m == 'p1'    else ft.Colors.GREY_800
+            f2_p2_btn.bgcolor  = ft.Colors.BLUE_900 if m == 'p2'    else ft.Colors.GREY_800
+            f2_clr_btn.bgcolor = ft.Colors.GREY_700 if m == 'clear' else ft.Colors.GREY_800
+
+        def _f2_set_p1(e):
+            f2_mode[0] = 'p1';    _f2_update_btns(); page.update()
+
+        def _f2_set_p2(e):
+            f2_mode[0] = 'p2';    _f2_update_btns(); page.update()
+
+        def _f2_set_clr(e):
+            f2_mode[0] = 'clear'; _f2_update_btns(); page.update()
+
+        f2_p1_btn.on_click  = _f2_set_p1
+        f2_p2_btn.on_click  = _f2_set_p2
+        f2_clr_btn.on_click = _f2_set_clr
+
+        def _f2_refresh():
+            i  = f2_idx[0]
+            sc = cfg.scene_configs[i]
+            persons = all_persons[i] if i < len(all_persons) else []
+            b64     = all_previews[i] if i < len(all_previews) else None
+
+            f2_lbl.value  = f"Scene {i + 1} / {n_sc}"
+            f2_note.value = ("(no YOLO detection — manual input recommended)"
+                             if not persons else f"({len(persons)} person(s) detected)")
+            if b64:
+                f2_img.src     = f"data:image/jpeg;base64,{b64}"
+                f2_img.visible = True
+                f2_no_prev.visible = False
+            else:
+                f2_img.src     = dummy_src
+                f2_img.visible = False
+                f2_no_prev.visible = True
+
+            def _dot_pos(hip_px):
+                """frame-pixel → display-pixel (top-left of 14px dot)."""
+                return hip_px[0] / _FSCALE - 7, hip_px[1] / _FSCALE - 7
+
+            if sc.p1_hip_px:
+                dx, dy = _dot_pos(sc.p1_hip_px)
+                f2_p1_dot.left, f2_p1_dot.top, f2_p1_dot.visible = dx, dy, True
+            else:
+                f2_p1_dot.visible = False
+
+            if sc.p2_hip_px:
+                dx, dy = _dot_pos(sc.p2_hip_px)
+                f2_p2_dot.left, f2_p2_dot.top, f2_p2_dot.visible = dx, dy, True
+            else:
+                f2_p2_dot.visible = False
+
+            p1_t = (f"P1: ({sc.p1_hip_px[0]}, {sc.p1_hip_px[1]})"
+                    if sc.p1_hip_px else "P1: (unset)")
+            p2_t = (f"P2: ({sc.p2_hip_px[0]}, {sc.p2_hip_px[1]})"
+                    if sc.p2_hip_px else "P2: (unset)")
+            f2_coords.value = f"{p1_t}   {p2_t}"
+            page.update()
+
+        def _f2_prev(e):
+            f2_idx[0] = max(0, f2_idx[0] - 1)
+            _f2_refresh()
+
+        def _f2_next(e):
+            f2_idx[0] = min(n_sc - 1, f2_idx[0] + 1)
+            _f2_refresh()
+
+        def _f2_tap(e):
+            i  = f2_idx[0]
+            sc = cfg.scene_configs[i]
+            lp = e.local_position
+            if lp is None:
+                return
+            px = int(lp.x * _FSCALE)
+            py = int(lp.y * _FSCALE)
+            m  = f2_mode[0]
+            if m == 'p1':
+                sc.p1_hip_px = (px, py)
+                sc.mode = 'manual'
+            elif m == 'p2':
+                sc.p2_hip_px = (px, py)
+                sc.mode = 'manual'
+            elif m == 'clear':
+                sc.p1_hip_px = sc.p2_hip_px = None
+                sc.mode = 'auto'
+            _f2_refresh()
+
+        f2_gesture = ft.GestureDetector(
+            content=ft.Stack([
+                ft.Container(
+                    content=ft.Stack([f2_no_prev, f2_img]),
+                    width=_DISP_W, height=_DISP_H,
+                    bgcolor=ft.Colors.GREY_900,
+                    border_radius=8,
+                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                ),
+                f2_p1_dot,
+                f2_p2_dot,
+            ], width=_DISP_W, height=_DISP_H),
+            on_tap_down=_f2_tap,
+        )
+
+        f2_content = ft.Column([
+            ft.Text(
+                "YOLO 탐지 실패 씬: 클릭으로 골반 위치를 지정하세요. 수동 앵커로 사용됩니다.",
+                size=11, color=ft.Colors.GREY_400,
+            ),
+            ft.Row([
+                ft.IconButton(ft.Icons.CHEVRON_LEFT, icon_color=ft.Colors.GREY_400,
+                              on_click=_f2_prev, tooltip="Previous scene"),
+                f2_lbl, f2_note,
+                ft.IconButton(ft.Icons.CHEVRON_RIGHT, icon_color=ft.Colors.GREY_400,
+                              on_click=_f2_next, tooltip="Next scene"),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+            f2_gesture,
+            ft.Row([f2_p1_btn, f2_p2_btn, f2_clr_btn], spacing=8),
+            f2_coords,
+        ], spacing=8)
+
+        # ══════════════════════════════════════════════════════════════════
+        # Assemble dialog with 3 tabs
+        # ══════════════════════════════════════════════════════════════════
+        _started = [False]
+
+        def on_start(e):
+            if _started[0]:
+                return
+            _started[0] = True
+            # Flush F3 toggle state into cfg
+            for sw, sc2 in zip(toggles, cfg.scene_configs):
+                sc2.enabled = sw.value
+            item.user_config = cfg
+            dialog.open = False
+            page.update()
+            if item._input_event:
+                item._input_event.set()
+
+        _tab_pad = ft.Padding.symmetric(horizontal=8, vertical=10)
+        tabs = ft.Tabs(
+            content=ft.Column([
+                ft.TabBar(tabs=[
+                    ft.Tab(label="Scenes"),
+                    ft.Tab(label="Persons"),
+                    ft.Tab(label="Manual Hip"),
+                ]),
+                ft.TabBarView(controls=[
+                    ft.Container(content=f3_content, padding=_tab_pad),
+                    ft.Container(content=f1_content, padding=_tab_pad),
+                    ft.Container(content=f2_content, padding=_tab_pad),
+                ], expand=True),
+            ]),
+            length=3,
+            selected_index=0,
+            expand=True,
+        )
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Configure — {item.filename}",
+                          size=14, weight=ft.FontWeight.W_600),
+            content=ft.Container(content=tabs, width=520, height=510),
+            actions=[
+                ft.Button(
+                    "Start Processing",
+                    icon=ft.Icons.PLAY_ARROW,
+                    on_click=on_start,
+                    bgcolor=ft.Colors.CYAN_700,
+                    color=ft.Colors.WHITE,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=on_start,
+        )
+
+        # Initialize dynamic tab views
+        _f1_refresh()
+        _f2_refresh()
+
+        if not hasattr(page, 'overlay') or page.overlay is None:
+            page.dialog = dialog
+            dialog.open = True
+        else:
+            page.overlay.append(dialog)
+            dialog.open = True
+        page.update()
+
+    def on_awaiting_input(item):
+        """Called from background thread when Pass 1 completes — auto-open dialog."""
+        _loop.call_soon_threadsafe(_schedule_show_dialog, item)
+
+    def _schedule_show_dialog(item):
+        show_preprocessing_dialog(item)
+
+    queue = ProcessingQueue(
+        on_update=rebuild_queue_ui,
+        on_frame=on_frame_update,
+        on_awaiting_input=on_awaiting_input,
+    )
 
     def remove_item(idx):
         queue.remove(idx)

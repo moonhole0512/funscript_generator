@@ -31,6 +31,81 @@ from scipy.signal import savgol_filter
 MULTI_SCENE_THRESHOLD = 3
 
 
+# ── Dataclasses for interactive preprocessing ─────────────────────────────
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class SceneConfig:
+    """씬별 사용자 설정 (인터랙티브 전처리 다이얼로그)."""
+    enabled       : bool  = True    # F3: 스트로크 생성 여부
+    mode          : str   = 'auto'  # 'auto' | 'manual' | 'optical_flow'
+    p1_person_idx : int   = 0       # F1: P1 인물 인덱스 (per_scene_persons 기준)
+    p2_person_idx : int   = 1       # F1: P2 인물 인덱스 (-1=없음)
+    p1_hip_px     : tuple = None    # F2: 수동 P1 골반 픽셀 (x,y)
+    p2_hip_px     : tuple = None    # F2: 수동 P2 골반 픽셀 (x,y)
+
+
+@_dataclass
+class Pass1Result:
+    """Pass 1 분석 결과 컨테이너."""
+    scene_boundaries   : list   # [(start, end), ...]
+    per_scene_rois     : list   # [roi_fraction, ...]
+    per_scene_anchors  : list   # [anchor_dict or None, ...]
+    per_scene_persons  : list   # [[person_dict, ...], ...]  씬별 탐지 인물
+    per_scene_previews : list   # [base64_jpeg_str, ...]  씬별 대표 프레임
+    fps                : float
+    total_frames       : int
+    video_duration_ms  : int
+    video_type         : str
+    yolo_tracker       : object  # YoloPoseTracker (or None)
+    flow_estimator     : object  # OpticalFlowEstimator
+
+
+@_dataclass
+class UserConfig:
+    """유저 인터랙션 설정."""
+    scene_configs : list  # [SceneConfig, ...]
+
+    @classmethod
+    def auto_from_pass1(cls, r: 'Pass1Result') -> 'UserConfig':
+        """자동 기본 설정 — 모든 씬 활성화, person 인덱스 기본값."""
+        return cls(scene_configs=[SceneConfig() for _ in r.scene_boundaries])
+
+
+def _extract_scene_frame(video_path: str, frame_idx: int):
+    """지정 프레임 추출 후 RESIZE_WIDTH로 리사이즈. 실패 시 None."""
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_idx))
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return None
+    return cv2.resize(frame, (RESIZE_WIDTH, int(frame.shape[0] * RESIZE_WIDTH / frame.shape[1])))
+
+
+def _draw_scene_preview(frame_bgr, persons: list) -> str:
+    """씬 대표 프레임에 인물 번호 bbox 오버레이 → base64 JPEG 반환."""
+    if frame_bgr is None:
+        return ""
+    vis = frame_bgr.copy()
+    # P1=노랑, P2=하늘, 나머지=회색
+    COLORS = [(0, 215, 255), (255, 200, 0), (150, 150, 150), (150, 150, 150)]
+    for idx, person in enumerate(persons[:4]):
+        color = COLORS[min(idx, len(COLORS) - 1)]
+        if person.get('bbox'):
+            x1, y1, x2, y2 = (int(v) for v in person['bbox'])
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(vis, f"P{idx+1}", (x1 + 4, y1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        if person.get('hip_px'):
+            hx, hy = int(person['hip_px'][0]), int(person['hip_px'][1])
+            cv2.circle(vis, (hx, hy), 5, color, -1)
+    _, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buf).decode('utf-8')
+
+
 # ── Debug overlay helpers ──────────────────────────────────────────────────
 
 def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detected,
@@ -782,25 +857,588 @@ def _get_scene_index(frame_idx, scene_boundaries):
     return len(scene_boundaries) - 1
 
 
+def pass1_analyze(video_path: str, progress_callback=None):
+    """Pass 1: 씬 탐지 + ROI + 앵커 + 씬별 인물 탐지 + 프리뷰 생성.
+
+    Returns Pass1Result or None on failure.
+    """
+    if not os.path.exists(video_path):
+        print(f"Error: Video not found at {video_path}")
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Cannot open video {video_path}")
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    video_duration_ms = int((total_frames / fps) * 1000)
+    cap.release()
+
+    if total_frames < 10:
+        print("Error: Video too short")
+        return None
+
+    if progress_callback:
+        progress_callback(0, 100, "Detecting scenes...")
+
+    scene_det = QuickSceneDetector(threshold=0.7)
+    scene_boundaries = scene_det.detect(video_path, sample_interval=5)
+    print(f"Detected {len(scene_boundaries)} scene(s): {[(s, e) for s, e in scene_boundaries]}")
+
+    video_type = _classify_video(scene_boundaries)
+    print(f"Video classification: {video_type} ({len(scene_boundaries)} scenes)")
+
+    if progress_callback:
+        progress_callback(3, 100, f"classified:{video_type}")
+
+    # YoloPoseTracker 초기화
+    yolo_tracker = None
+    if YOLO_AVAILABLE:
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'models', 'yolo26x-pose.pt')
+        try:
+            yolo_tracker = YoloPoseTracker(model_path)
+            print(f"YoloPoseTracker enabled (device: {DEVICE})")
+        except Exception as e:
+            yolo_tracker = None
+            print(f"YoloPoseTracker init failed (skipping): {e}")
+
+    if progress_callback:
+        progress_callback(5, 100, "Detecting ROI...")
+
+    flow_estimator = OpticalFlowEstimator()
+    roi_detector = ROIDetector(flow_estimator)
+
+    per_scene_rois     = []
+    per_scene_anchors  = []
+    per_scene_persons  = []
+    per_scene_previews = []
+    anchor_selector    = SceneAnchorSelector() if yolo_tracker is not None else None
+    n_scenes           = max(len(scene_boundaries), 1)
+
+    for i, (scene_start, scene_end) in enumerate(scene_boundaries):
+        scene_length = scene_end - scene_start
+        scene_sample_count = min(40, max(10, scene_length // 5))
+        roi = roi_detector.detect_roi(video_path, sample_count=scene_sample_count,
+                                      frame_range=(scene_start, scene_end),
+                                      yolo_tracker=yolo_tracker)
+        per_scene_rois.append(roi)
+        print(f"  Scene {i+1} [{scene_start}-{scene_end}]: "
+              f"ROI y=[{roi[0]:.2f}-{roi[1]:.2f}], x=[{roi[2]:.2f}-{roi[3]:.2f}]")
+
+        if anchor_selector is not None:
+            anchor = anchor_selector.select(
+                video_path, scene_start, scene_end, yolo_tracker, n_samples=10
+            )
+            per_scene_anchors.append(anchor)
+            print(f"  Scene {i+1} anchor: dual={anchor['is_dual']}, "
+                  f"conf={anchor['confidence']:.2f}")
+        else:
+            per_scene_anchors.append(None)
+
+        # 씬 대표 프레임 + 인물 탐지 (UI 프리뷰용)
+        # 5개 프레임을 샘플링하여 가장 많은 인물이 탐지되는 프레임 선택
+        # (단일 중간 프레임만 사용하면 특정 프레임에서 인물이 가려질 수 있음)
+        scene_len = max(scene_end - scene_start, 1)
+        sample_offsets = [0.20, 0.35, 0.50, 0.65, 0.80]
+        best_frame, best_persons = None, []
+        for t in sample_offsets:
+            fi = scene_start + int(scene_len * t)
+            f = _extract_scene_frame(video_path, fi)
+            if f is None:
+                continue
+            ps = yolo_tracker.detect_persons_stateless(f) if yolo_tracker is not None else []
+            # 더 많은 인원이 탐지되거나, 같은 수라면 총 신뢰도가 더 높은 프레임 채택
+            if (len(ps) > len(best_persons) or
+                    (len(ps) == len(best_persons) and
+                     sum(p['confidence'] for p in ps) > sum(p['confidence'] for p in best_persons))):
+                best_frame, best_persons = f, ps
+        frame_bgr = best_frame
+        persons   = best_persons
+        per_scene_persons.append(persons)
+        per_scene_previews.append(_draw_scene_preview(frame_bgr, persons))
+
+        if progress_callback:
+            pct = 5 + int((i + 1) / n_scenes * 10)
+            progress_callback(pct, 100, f"ROI detection ({i+1}/{n_scenes})...")
+
+    if progress_callback:
+        progress_callback(15, 100, "ROI detection complete.")
+
+    return Pass1Result(
+        scene_boundaries   = scene_boundaries,
+        per_scene_rois     = per_scene_rois,
+        per_scene_anchors  = per_scene_anchors,
+        per_scene_persons  = per_scene_persons,
+        per_scene_previews = per_scene_previews,
+        fps                = fps,
+        total_frames       = total_frames,
+        video_duration_ms  = video_duration_ms,
+        video_type         = video_type,
+        yolo_tracker       = yolo_tracker,
+        flow_estimator     = flow_estimator,
+    )
+
+
+def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
+                  progress_callback=None, frame_callback=None) -> bool:
+    """Pass 2: 모션 추출 + funscript 생성. user_config 반영.
+
+    r   : pass1_analyze() 결과
+    cfg : UserConfig (유저 설정, None이면 자동)
+    """
+    if cfg is None:
+        cfg = UserConfig.auto_from_pass1(r)
+
+    scene_boundaries  = r.scene_boundaries
+    per_scene_rois    = r.per_scene_rois
+    per_scene_anchors = r.per_scene_anchors
+    per_scene_persons = r.per_scene_persons
+    yolo_tracker      = r.yolo_tracker
+    flow_estimator    = r.flow_estimator
+    fps               = r.fps
+    total_frames      = r.total_frames
+    video_type        = r.video_type
+    roi_strategy      = "per_scene"
+
+    # ── F3: 비활성 씬 프레임 집합 ──
+    disabled_frame_set = set()
+    for si, sc in enumerate(cfg.scene_configs):
+        if not sc.enabled and si < len(scene_boundaries):
+            s, e = scene_boundaries[si]
+            disabled_frame_set.update(range(s, e))
+
+    # SceneTypeDetector — yolo_tracker 유무와 무관하게 초기화
+    scene_type_detector = SceneTypeDetector(fps=fps)
+
+    # ── Phase 3: Sequential motion extraction with dynamic ROI tracking ──
+    motion_extractor = MotionExtractor(flow_estimator)
+    roi_tracker = DynamicROITracker(fps)
+
+    initial_roi = _get_roi_for_frame(0, scene_boundaries, per_scene_rois)
+    roi_tracker.reset(initial_roi)
+
+    scene_change_set = {s for s, _ in scene_boundaries if s > 0}
+
+    boundary_frame_set = set()
+    for s_frame, _ in scene_boundaries:
+        if s_frame > 30:
+            for fi in range(max(0, s_frame - 5), min(total_frames, s_frame + 30)):
+                boundary_frame_set.add(fi)
+
+    cap = cv2.VideoCapture(video_path)
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        return False
+
+    prev_frame = cv2.resize(
+        prev_frame,
+        (RESIZE_WIDTH, int(prev_frame.shape[0] * (RESIZE_WIDTH / prev_frame.shape[1])))
+    )
+
+    velocity_signal = []
+    magnitude_signal = []
+    yolo_hip_ys    = []
+    yolo_ref_lens  = []
+    yolo_confs     = []
+    yolo_rel_dists = []
+    yolo_is_duals  = []
+    quality_records = []
+    contact_ys     = []
+    scene_types    = []
+    head_hip_dists = []
+    anchor_dists   = []
+    contact_tracker    = ContactPointTracker()
+    anchor_tracker     = DualAnchorTracker()
+    anchor_initialized = False
+
+    _empty_yolo = {'hip_center_y': None, 'reference_length': None,
+                   'confidence': 0.0, 'bbox': None, 'keypoints': None,
+                   'secondary_hip_y': None, 'secondary_bbox': None,
+                   'secondary_keypoints': None,
+                   'rel_dist': None, 'is_dual': False}
+
+    for i in range(total_frames - 1):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_resized = cv2.resize(
+            frame,
+            (RESIZE_WIDTH, int(frame.shape[0] * (RESIZE_WIDTH / frame.shape[1])))
+        )
+        frame_h, frame_w = frame_resized.shape[:2]
+
+        # ── F3: 비활성 씬 스킵 ──
+        if i in disabled_frame_set:
+            velocity_signal.append(0.0)
+            magnitude_signal.append(0.0)
+            yolo_hip_ys.append(None)
+            yolo_ref_lens.append(None)
+            yolo_confs.append(0.0)
+            yolo_rel_dists.append(None)
+            yolo_is_duals.append(False)
+            quality_records.append({'conf': 0.0, 'is_dual': False, 'near_boundary': False})
+            contact_ys.append(None)
+            scene_types.append('QUIET')
+            head_hip_dists.append(None)
+            anchor_dists.append(None)
+            prev_frame = frame_resized
+            continue
+
+        if i in scene_change_set:
+            new_scene_roi = _get_roi_for_frame(i, scene_boundaries, per_scene_rois)
+            roi_tracker.reset(new_scene_roi)
+            if yolo_tracker is not None:
+                yolo_tracker.reset_tracking()
+                # ── F1: 인물 선택 힌트 적용 ──
+                si = _get_scene_index(i, scene_boundaries)
+                if si < len(cfg.scene_configs) and si < len(per_scene_persons):
+                    sc = cfg.scene_configs[si]
+                    persons = per_scene_persons[si]
+                    p1_bbox = persons[sc.p1_person_idx]['bbox'] if sc.p1_person_idx < len(persons) else None
+                    p2_bbox = (persons[sc.p2_person_idx]['bbox']
+                               if sc.p2_person_idx >= 0 and sc.p2_person_idx < len(persons) else None)
+                    if p1_bbox is not None:
+                        yolo_tracker.set_slot_hint(p1_bbox, p2_bbox)
+            scene_type_detector.reset()
+            contact_tracker.reset()
+            anchor_initialized = False
+            # ── F2: 수동 골반 앵커 ──
+            si = _get_scene_index(i, scene_boundaries)
+            if si < len(cfg.scene_configs):
+                sc2 = cfg.scene_configs[si]
+                if sc2.p1_hip_px is not None:
+                    frame_gray_tmp = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+                    anchor_tracker.reset(sc2.p1_hip_px, sc2.p2_hip_px,
+                                         frame_gray_tmp, frame_h, frame_w)
+                    anchor_initialized = True
+
+        flow = flow_estimator.estimate_flow(prev_frame, frame_resized)
+        current_roi = roi_tracker.update(flow, frame_h, frame_w)
+
+        velocity, magnitude, _, zoom_detected = motion_extractor.extract_velocity_signal(
+            prev_frame, frame_resized, current_roi, precomputed_flow=flow
+        )
+
+        velocity_signal.append(velocity)
+        magnitude_signal.append(magnitude)
+
+        yolo_result = dict(_empty_yolo)
+        if yolo_tracker is not None:
+            yolo_result = yolo_tracker.process_frame(frame_resized,
+                                                      roi_fractions=current_roi)
+
+        scene_type = scene_type_detector.update(
+            p1_kp=yolo_result.get('keypoints'),
+            p2_kp=yolo_result.get('secondary_keypoints'),
+            p2_hip_y=yolo_result.get('secondary_hip_y'),
+            frame_h=frame_h,
+        )
+
+        yolo_hip_ys.append(yolo_result['hip_center_y'])
+        yolo_ref_lens.append(yolo_result['reference_length'])
+        yolo_confs.append(yolo_result['confidence'])
+        yolo_rel_dists.append(yolo_result.get('rel_dist'))
+        yolo_is_duals.append(yolo_result.get('is_dual', False))
+        scene_types.append(scene_type)
+        head_hip_dists.append(_compute_bj_dist(yolo_result, frame_h))
+        quality_records.append({
+            'conf'         : yolo_result.get('confidence', 0.0),
+            'is_dual'      : yolo_result.get('is_dual', False),
+            'near_boundary': i in boundary_frame_set,
+        })
+
+        frame_gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+        if yolo_result.get('is_dual'):
+            cpx, cpy = _compute_contact_pixel(yolo_result, frame_h, frame_w)
+        else:
+            cpx, cpy = None, None
+        contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w)
+        contact_ys.append(contact_y)
+
+        if not anchor_initialized:
+            si = _get_scene_index(i, scene_boundaries)
+            # F2 수동 앵커 확인
+            if si < len(cfg.scene_configs) and cfg.scene_configs[si].p1_hip_px is not None:
+                sc2 = cfg.scene_configs[si]
+                anchor_tracker.reset(sc2.p1_hip_px, sc2.p2_hip_px,
+                                     frame_gray, frame_h, frame_w)
+                anchor_initialized = True
+            else:
+                anchor_info = per_scene_anchors[si] if si < len(per_scene_anchors) else None
+                if (anchor_info and anchor_info['is_dual']
+                        and anchor_info['frame_h'] > 0 and anchor_info['frame_w'] > 0):
+                    scale_y = frame_h / anchor_info['frame_h']
+                    scale_x = frame_w / anchor_info['frame_w']
+                    p1_scaled = (anchor_info['p1_hip_px'][0] * scale_x,
+                                 anchor_info['p1_hip_px'][1] * scale_y)
+                    p2_scaled = (anchor_info['p2_hip_px'][0] * scale_x,
+                                 anchor_info['p2_hip_px'][1] * scale_y)
+                    anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w)
+                    anchor_initialized = True
+
+        anchor_dist = None
+        if anchor_initialized:
+            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w)
+            if anchor_dist is None:
+                anchor_initialized = False
+        anchor_dists.append(anchor_dist)
+
+        # ── F2 앵커 hip_y → YOLO 낮은 신뢰도 프레임 보완 ──────────────────────
+        # F2 수동 hip 지정 씬에서 YOLO가 P1을 잃으면, LK 앵커로 추적한 P1 y좌표를
+        # yolo_hip_ys에 주입하여 스트로크 신호 연속성을 유지한다.
+        si_cur = _get_scene_index(i, scene_boundaries)
+        f2_set = (si_cur < len(cfg.scene_configs)
+                  and cfg.scene_configs[si_cur].p1_hip_px is not None)
+        if f2_set and anchor_initialized:
+            cur_conf = yolo_confs[-1] if yolo_confs else 0.0
+            if cur_conf < 0.45:
+                p1_y_anchor = anchor_tracker.get_p1_y_norm()
+                if p1_y_anchor is not None:
+                    yolo_hip_ys[-1] = p1_y_anchor
+                    yolo_confs[-1]  = 0.55   # anchor 신뢰도 (중간값)
+                    if yolo_ref_lens[-1] is None:
+                        yolo_ref_lens[-1] = 0.40  # 전형적 body height / frame_h
+
+        prev_frame = frame_resized
+
+        if i % 5 == 0:
+            pct = 15 + int((i / total_frames) * 55)
+            if progress_callback:
+                progress_callback(pct, 100, f"Extracting motion... ({i+1}/{total_frames})")
+            if frame_callback:
+                _anc1, _anc2 = anchor_tracker.get_anchor_pixels() if anchor_initialized else (None, None)
+                b64 = _draw_debug_overlay(
+                    frame_resized, current_roi, velocity, magnitude,
+                    zoom_detected, i + 1, fps,
+                    bbox=yolo_result['bbox'],
+                    keypoints=yolo_result['keypoints'],
+                    secondary_hip_y=yolo_result.get('secondary_hip_y'),
+                    secondary_bbox=yolo_result.get('secondary_bbox'),
+                    rel_dist=yolo_result.get('rel_dist'),
+                    secondary_keypoints=yolo_result.get('secondary_keypoints'),
+                    scene_type=scene_type,
+                    anchor_p1=_anc1,
+                    anchor_p2=_anc2,
+                    anchor_dist=anchor_dist,
+                )
+                frame_callback(b64, {
+                    'type': 'frame',
+                    'frame': i + 1,
+                    'total': total_frames,
+                    'velocity': round(velocity, 3),
+                    'magnitude': round(magnitude, 3),
+                    'zoom': zoom_detected,
+                })
+
+    cap.release()
+
+    if yolo_tracker is not None:
+        yolo_tracker.close()
+
+    velocity_signal = np.array(velocity_signal, dtype=np.float64)
+    magnitude_signal = np.array(magnitude_signal, dtype=np.float64)
+
+    if len(velocity_signal) < 10:
+        print("Error: Not enough frames processed")
+        return False
+
+    has_yolo = yolo_tracker is not None and len(yolo_hip_ys) == len(velocity_signal)
+
+    dual_coverage = (sum(yolo_is_duals) / max(len(yolo_is_duals), 1)
+                     if yolo_is_duals else 0.0)
+    print(f"Dual mode coverage: {dual_coverage:.1%}")
+
+    contact_coverage = (sum(1 for y in contact_ys if y is not None) / max(len(contact_ys), 1)
+                        if contact_ys else 0.0)
+    print(f"LK contact tracking coverage: {contact_coverage:.1%}")
+
+    st_arr  = np.array(scene_types) if scene_types else np.array([])
+    bj_mask = (st_arr == 'BJ')
+    bj_coverage = float(bj_mask.sum()) / max(len(st_arr), 1)
+    print(f"Scene coverage — BJ: {bj_coverage:.1%}")
+
+    anchor_coverage = (sum(1 for d in anchor_dists if d is not None) / max(len(anchor_dists), 1)
+                       if anchor_dists else 0.0)
+    print(f"Dual anchor tracking coverage: {anchor_coverage:.1%}")
+
+    if (contact_coverage >= 0.40 and len(contact_ys) == len(velocity_signal)
+            and dual_coverage >= 0.30):
+        velocity_signal = _blend_contact_tracking(velocity_signal, contact_ys, yolo_is_duals)
+        print("Using LK contact point tracking signal")
+    elif (anchor_coverage >= 0.30 and len(anchor_dists) == len(velocity_signal)):
+        velocity_signal = _blend_anchor_dist(velocity_signal, anchor_dists)
+        print(f"Using dual-anchor LK distance signal ({anchor_coverage:.1%} coverage)")
+    elif (bj_coverage >= 0.25 and len(head_hip_dists) == len(velocity_signal)
+          and len(st_arr) == len(velocity_signal)):
+        velocity_signal = _blend_bj_pose(velocity_signal, head_hip_dists, bj_mask)
+        print(f"Using BJ head-hip distance signal ({bj_coverage:.1%} coverage)")
+    elif dual_coverage >= 0.50 and len(yolo_rel_dists) == len(velocity_signal):
+        velocity_signal = _blend_dual_pose(velocity_signal, yolo_rel_dists, yolo_is_duals)
+        print("Using dual-person relative distance signal")
+    elif has_yolo:
+        velocity_signal = _blend_yolo_pose(
+            velocity_signal, yolo_hip_ys, yolo_ref_lens, yolo_confs
+        )
+        yolo_confident = sum(1 for c in yolo_confs if c and c > 0.5)
+        print(f"Pose blend (YOLO-only): {yolo_confident} high-conf frames")
+
+    if quality_records and len(quality_records) == len(velocity_signal):
+        quality_mask = _build_quality_mask(quality_records)
+        bad_ratio = float(quality_mask.sum()) / max(len(quality_mask), 1)
+        print(f"Quality mask: {bad_ratio:.1%} bad frames suppressed")
+        velocity_signal = _postprocess_velocity(velocity_signal, quality_mask)
+
+    suppress_frames = 30 if dual_coverage >= 0.20 else 0
+    boundary_handler = SceneBoundaryHandler()
+    velocity_signal = boundary_handler.smooth_at_boundaries(
+        velocity_signal, scene_boundaries, fps,
+        post_cut_suppress_frames=suppress_frames
+    )
+    magnitude_signal = boundary_handler.smooth_at_boundaries(
+        magnitude_signal, scene_boundaries, fps
+    )
+
+    if progress_callback:
+        progress_callback(70, 100, "Analyzing scenes...")
+
+    if len(velocity_signal) > 5:
+        velocity_smoothed = savgol_filter(velocity_signal, 5, 1)
+    else:
+        velocity_smoothed = velocity_signal
+
+    scene_segmenter = SceneSegmenter(fps)
+    scene_change_frames = [s for s, _ in scene_boundaries]
+
+    yolo_overall_det = (
+        sum(1 for c in yolo_confs if c and c > 0.3) / max(len(yolo_confs), 1)
+        if has_yolo and yolo_confs else 0.0
+    )
+    use_yolo_quiet = has_yolo and yolo_overall_det >= 0.20
+    print(f"YOLO overall detection rate: {yolo_overall_det:.1%} → QUIET suppression: {'ON' if use_yolo_quiet else 'OFF'}")
+
+    segments = scene_segmenter.classify_segments(
+        magnitude_signal, scene_change_frames, len(velocity_signal),
+        velocity_signal=velocity_smoothed,
+        yolo_confs=yolo_confs if use_yolo_quiet else None,
+    )
+
+    active_count = sum(1 for _, _, t in segments if t == 'ACTIVE')
+    quiet_count = sum(1 for _, _, t in segments if t == 'QUIET')
+    trans_count = sum(1 for _, _, t in segments if t == 'TRANSITION')
+    print(f"Segments: {len(segments)} total "
+          f"({active_count} active, {trans_count} transition, {quiet_count} quiet)")
+
+    if progress_callback:
+        progress_callback(75, 100, "Estimating position signal...")
+
+    position_estimator = PositionEstimator(fps)
+    position_raw = position_estimator.velocity_to_position(
+        velocity_smoothed, segments, scene_boundaries=scene_boundaries
+    )
+    position_normalized = position_estimator.normalize_per_segment(position_raw, segments)
+    position_normalized = position_estimator.expand_contrast(position_normalized, segments=segments)
+
+    if progress_callback:
+        progress_callback(85, 100, "Generating action points...")
+
+    action_generator = ActionPointGenerator(fps)
+    actions = action_generator.generate(position_normalized, segments, velocity_signal=velocity_smoothed)
+
+    if frame_callback:
+        graph_b64 = _draw_result_graph(
+            position_normalized, actions, segments, fps, len(velocity_signal)
+        )
+        frame_callback(graph_b64, {
+            'type': 'result',
+            'actions': len(actions),
+            'active_segs': active_count,
+            'quiet_segs': quiet_count,
+        })
+
+    if progress_callback:
+        progress_callback(90, 100, "Post-processing...")
+
+    actions = _normalize_stroke_amplitude(actions, segments, fps, min_range=45)
+
+    post_processor = ScriptPostProcessor()
+    actions = post_processor.validate_and_fix(actions, max_speed=500)
+
+    video_dir = os.path.dirname(video_path)
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_path = os.path.join(video_dir, base_name + ".funscript")
+
+    roi_info = []
+    for i, (roi, (s, e)) in enumerate(zip(per_scene_rois, scene_boundaries)):
+        roi_info.append({
+            "scene": i + 1,
+            "frames": [int(s), int(e)],
+            "y_range": [round(float(roi[0]), 3), round(float(roi[1]), 3)],
+            "x_range": [round(float(roi[2]), 3), round(float(roi[3]), 3)]
+        })
+
+    output_script = {
+        "actions": actions,
+        "inverted": False,
+        "metadata": {
+            "version": "3.1",
+            "creator": "Eroscript Generator AI",
+            "video_type": video_type,
+            "roi_strategy": roi_strategy,
+            "pipeline": [
+                "Quick scene detection",
+                f"Video classification ({video_type})",
+                f"ROI detection ({roi_strategy})",
+                "Signed vertical flow extraction",
+                "Per-scene adaptive threshold segmentation",
+                "Adaptive Butterworth HPF drift removal",
+                "Per-segment normalization with noise guard",
+                "Adaptive contrast expansion",
+                "Frequency-adaptive action sampling",
+                "Physics validation"
+            ],
+            "total_actions": len(actions),
+            "scenes": len(scene_boundaries),
+            "roi_per_scene": roi_info,
+            "segments": {
+                "total": len(segments),
+                "active": active_count,
+                "transition": trans_count,
+                "quiet": quiet_count
+            }
+        },
+        "range": 100
+    }
+
+    with open(output_path, 'w') as f:
+        json.dump(output_script, f, indent=2)
+
+    if progress_callback:
+        progress_callback(100, 100, f"Done! Saved to {os.path.basename(output_path)}")
+
+    print(f"\nGenerated {len(actions)} actions")
+    print(f"Saved to: {output_path}")
+
+    return True
+
+
 def run_analysis(video_path, progress_callback=None, frame_callback=None):
-    """
-    Two-pass funscript generation pipeline with per-scene adaptive ROI.
+    """CLI/기존 호환 자동 모드 래퍼 — pass1_analyze + pass2_extract 순차 실행."""
+    r = pass1_analyze(video_path, progress_callback)
+    if r is None:
+        return False
+    cfg = UserConfig.auto_from_pass1(r)
+    return pass2_extract(video_path, r, cfg, progress_callback, frame_callback)
 
-    Pipeline:
-    Pass 1 (lightweight):
-      1. Quick scene detection (histogram-based)
-      2. Per-scene ROI detection (optical flow only within each scene)
 
-    Pass 2 (full extraction):
-      3. Frame-by-frame motion extraction using per-scene ROIs
-      4. Scene segmentation with per-scene thresholds
-      5. Position estimation with adaptive HPF
-      6. Per-segment normalization with noise guard
-      7. Adaptive contrast expansion
-      8. Frequency-adaptive action point generation
-      9. Physics validation
-      10. Save output
-    """
+def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None):
+    """레거시 단일 함수 버전 (참조용 보존, 실제 호출 안됨)."""
     if not os.path.exists(video_path):
         print(f"Error: Video not found at {video_path}")
         return False
@@ -1039,7 +1677,7 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
         prev_frame = frame_resized
 
         if i % 5 == 0:
-            pct = 15 + int((i / total_frames) * 55)  # 15-70%
+            pct = 15 + int((i / total_frames) * 55)   # 15-70%
             if progress_callback:
                 progress_callback(pct, 100, f"Extracting motion... ({i+1}/{total_frames})")
             if frame_callback:
@@ -1232,9 +1870,9 @@ def run_analysis(video_path, progress_callback=None, frame_callback=None):
     for i, (roi, (s, e)) in enumerate(zip(per_scene_rois, scene_boundaries)):
         roi_info.append({
             "scene": i + 1,
-            "frames": [s, e],
-            "y_range": [round(roi[0], 2), round(roi[1], 2)],
-            "x_range": [round(roi[2], 2), round(roi[3], 2)]
+            "frames": [int(s), int(e)],
+            "y_range": [round(float(roi[0]), 3), round(float(roi[1]), 3)],
+            "x_range": [round(float(roi[2]), 3), round(float(roi[3]), 3)]
         })
 
     output_script = {
