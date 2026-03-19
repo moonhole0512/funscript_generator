@@ -266,19 +266,31 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
         cv2.putText(vis, f"MODE:{scene_type}", (4, 48),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, _st_color, 1, cv2.LINE_AA)
 
-    # ── DualAnchor 시각화 ──
+    # ── DualAnchor 시각화 (Manual Hip) ──
     if anchor_p1 is not None:
-        cv2.circle(vis, (int(anchor_p1[0]), int(anchor_p1[1])), 6, (0, 80, 255), -1)
-        cv2.circle(vis, (int(anchor_p1[0]), int(anchor_p1[1])), 7, (0, 80, 255), 1)
+        ax1, ay1 = int(anchor_p1[0]), int(anchor_p1[1])
+        # 빨간색 크로스헤어
+        cv2.line(vis, (ax1 - 12, ay1), (ax1 + 12, ay1), (0, 0, 255), 2)
+        cv2.line(vis, (ax1, ay1 - 12), (ax1, ay1 + 12), (0, 0, 255), 2)
+        cv2.circle(vis, (ax1, ay1), 3, (255, 255, 255), -1)
+        # 상단에 강조 텍스트
+        cv2.putText(vis, "MANUAL HIP ACTIVE", (w // 2 - 75, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
     if anchor_p2 is not None:
-        cv2.circle(vis, (int(anchor_p2[0]), int(anchor_p2[1])), 6, (255, 120, 0), -1)
-        cv2.circle(vis, (int(anchor_p2[0]), int(anchor_p2[1])), 7, (255, 120, 0), 1)
+        ax2, ay2 = int(anchor_p2[0]), int(anchor_p2[1])
+        # 파란색 크로스헤어
+        cv2.line(vis, (ax2 - 12, ay2), (ax2 + 12, ay2), (255, 0, 0), 2)
+        cv2.line(vis, (ax2, ay2 - 12), (ax2, ay2 + 12), (255, 0, 0), 2)
+        cv2.circle(vis, (ax2, ay2), 3, (255, 255, 255), -1)
+
     if anchor_p1 is not None and anchor_p2 is not None:
         cv2.line(vis, (int(anchor_p1[0]), int(anchor_p1[1])),
-                 (int(anchor_p2[0]), int(anchor_p2[1])), (60, 220, 120), 1)
+                 (int(anchor_p2[0]), int(anchor_p2[1])), (0, 255, 255), 1)
+
     if anchor_dist is not None:
         cv2.putText(vis, f"ANC D:{anchor_dist:.3f}", (4, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 220, 120), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
 
     # ── 시간 레이블 ──
     t_sec = frame_idx / max(fps, 1.0)
@@ -951,9 +963,14 @@ def pass1_analyze(video_path: str, progress_callback=None):
             f = _extract_scene_frame(video_path, fi)
             if f is None:
                 continue
+
+            # 이 씬에서 처음으로 유효하게 추출된 프레임을 기본 fallback으로 저장
+            if best_frame is None:
+                best_frame, best_persons = f, []
+
             ps = yolo_tracker.detect_persons_stateless(f) if yolo_tracker is not None else []
             # 더 많은 인원이 탐지되거나, 같은 수라면 총 신뢰도가 더 높은 프레임 채택
-            if (len(ps) > len(best_persons) or
+            if ps and (len(ps) > len(best_persons) or
                     (len(ps) == len(best_persons) and
                      sum(p['confidence'] for p in ps) > sum(p['confidence'] for p in best_persons))):
                 best_frame, best_persons = f, ps
@@ -1062,6 +1079,19 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                    'secondary_hip_y': None, 'secondary_bbox': None,
                    'secondary_keypoints': None,
                    'rel_dist': None, 'is_dual': False}
+
+    # ── F1: 첫 번째 씬(Frame 0)에 대한 추적기 초기화 및 힌트 적용 ──
+    if yolo_tracker is not None:
+        yolo_tracker.reset_tracking()
+        si = _get_scene_index(0, scene_boundaries)
+        if si < len(cfg.scene_configs) and si < len(per_scene_persons):
+            sc = cfg.scene_configs[si]
+            persons = per_scene_persons[si]
+            p1_bbox = persons[sc.p1_person_idx]['bbox'] if sc.p1_person_idx < len(persons) else None
+            p2_bbox = (persons[sc.p2_person_idx]['bbox']
+                       if sc.p2_person_idx >= 0 and sc.p2_person_idx < len(persons) else None)
+            if p1_bbox is not None:
+                yolo_tracker.set_slot_hint(p1_bbox, p2_bbox)
 
     for i in range(total_frames - 1):
         ret, frame = cap.read()

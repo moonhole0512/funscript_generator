@@ -627,7 +627,13 @@ async def main(page: ft.Page):
         # ══════════════════════════════════════════════════════════════════
         # Tab 2 — Per-scene person selection (P1/P2 dropdown)
         # ══════════════════════════════════════════════════════════════════
-        f1_idx = [0]
+        # Find first enabled scene for initial tab view
+        initial_enabled_idx = 0
+        for idx2, sc2 in enumerate(cfg.scene_configs):
+            if sc2.enabled:
+                initial_enabled_idx = idx2
+                break
+        f1_idx = [initial_enabled_idx]
         # Use transparent 1x1 pixel gif as dummy src to prevent 'A valid src value must be specified'
         dummy_src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
         f1_img      = ft.Image(src=dummy_src, width=_DISP_W, height=_DISP_H, fit=ft.BoxFit.CONTAIN,
@@ -673,12 +679,22 @@ async def main(page: ft.Page):
             page.update()
 
         def _f1_prev(e):
-            f1_idx[0] = max(0, f1_idx[0] - 1)
-            _f1_refresh()
+            curr = f1_idx[0]
+            while curr > 0:
+                curr -= 1
+                if toggles[curr].value:
+                    f1_idx[0] = curr
+                    _f1_refresh()
+                    return
 
         def _f1_next(e):
-            f1_idx[0] = min(n_sc - 1, f1_idx[0] + 1)
-            _f1_refresh()
+            curr = f1_idx[0]
+            while curr < n_sc - 1:
+                curr += 1
+                if toggles[curr].value:
+                    f1_idx[0] = curr
+                    _f1_refresh()
+                    return
 
         def _f1_p1_changed(e):
             try:
@@ -723,7 +739,7 @@ async def main(page: ft.Page):
         # ══════════════════════════════════════════════════════════════════
         # Tab 3 — Manual hip pixel click input
         # ══════════════════════════════════════════════════════════════════
-        f2_idx  = [0]
+        f2_idx  = [initial_enabled_idx]
         f2_mode = ['p1']  # 'p1' | 'p2' | 'clear'
 
         f2_img      = ft.Image(src=dummy_src, width=_DISP_W, height=_DISP_H, fit=ft.BoxFit.CONTAIN)
@@ -805,12 +821,22 @@ async def main(page: ft.Page):
             page.update()
 
         def _f2_prev(e):
-            f2_idx[0] = max(0, f2_idx[0] - 1)
-            _f2_refresh()
+            curr = f2_idx[0]
+            while curr > 0:
+                curr -= 1
+                if toggles[curr].value:
+                    f2_idx[0] = curr
+                    _f2_refresh()
+                    return
 
         def _f2_next(e):
-            f2_idx[0] = min(n_sc - 1, f2_idx[0] + 1)
-            _f2_refresh()
+            curr = f2_idx[0]
+            while curr < n_sc - 1:
+                curr += 1
+                if toggles[curr].value:
+                    f2_idx[0] = curr
+                    _f2_refresh()
+                    return
 
         def _f2_tap(e):
             i  = f2_idx[0]

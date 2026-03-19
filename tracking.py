@@ -216,7 +216,7 @@ class YoloPoseTracker:
     KP_BODY_WEIGHTS = {11: 2.0, 12: 2.0, 13: 0.6, 14: 0.6}
     HIP_KNEE_RATIO, MIN_KP_CONF, MIN_DET_CONF = 0.12, 0.30, 0.40
     MAX_SLOTS, SLOT_MATCH_DIST, HIP_HISTORY_LEN, MAX_MISS_FRAMES = 2, 0.25, 40, 20
-    DUAL_WARMUP_FRAMES, DUAL_STABLE_FRAMES, IOU_DUPLICATE_THRESH, EMA_HIP_ALPHA = 30, 15, 0.30, 0.4
+    DUAL_WARMUP_FRAMES, DUAL_STABLE_FRAMES, IOU_DUPLICATE_THRESH, EMA_HIP_ALPHA = 30, 15, 0.60, 0.4
     MIN_ROI_OVERLAP, P2_PROXIMITY_MAR, MIN_P2_SIZE_RATIO = 0.05, 0.60, 0.35
 
     def __init__(self, model_path: str, device: str = None, fps: float = 30.0):
@@ -261,14 +261,35 @@ class YoloPoseTracker:
         persons = self._parse_all_persons(res, (fh, fw), roi_fractions)
         self._last_result = self._update_slots(persons, fw, fh)
         return self._last_result
-
     def _parse_all_persons(self, results, hw, roi=None):
         out = []
         if not results or results[0].boxes is None: return out
         boxes, kps, fh, fw = results[0].boxes, results[0].keypoints, hw[0], hw[1]
         ids = boxes.id.int().cpu().numpy() if hasattr(boxes, 'id') and boxes.id is not None else None
+        
+        # NMS deduplication to prevent YOLO from detecting the same person twice
+        # Sort by confidence first
+        raw_preds = []
         for i, (cls, conf) in enumerate(zip(boxes.cls.cpu().numpy(), boxes.conf.cpu().numpy())):
             if int(cls) != 0 or float(conf) < self.MIN_DET_CONF: continue
+            raw_preds.append((i, float(conf)))
+            
+        raw_preds.sort(key=lambda x: x[1], reverse=True)
+        
+        kept_indices = []
+        for i, conf in raw_preds:
+            bbox_i = tuple(float(v) for v in boxes.xyxy[i].cpu().numpy())
+            is_dup = False
+            for j in kept_indices:
+                bbox_j = tuple(float(v) for v in boxes.xyxy[j].cpu().numpy())
+                if self._iou(bbox_i, bbox_j) > self.IOU_DUPLICATE_THRESH:
+                    is_dup = True
+                    break
+            if not is_dup:
+                kept_indices.append(i)
+
+        for i in kept_indices:
+            cls, conf = int(boxes.cls[i].item()), float(boxes.conf[i].item())
             bbox = tuple(float(v) for v in boxes.xyxy[i].cpu().numpy())
             if roi:
                 ry1, ry2, rx1, rx2 = roi
@@ -423,7 +444,7 @@ class YoloPoseTracker:
         try: res = self._model(frame_bgr, verbose=False, device=self._device)
         except: return []
         fh, fw = frame_bgr.shape[:2]
-        ps = self._parse_all_persons(res, (fh, fw))
+        ps = self._parse_all_persons(res, (fh, fw), None)
         out = []
         for p in ps:
             kp, bbox = p.get('keypoints'), p.get('bbox')
@@ -459,10 +480,180 @@ class ContactPointTracker:
     def update(self, frame_gray, contact_px, contact_py, fh, fw): return None
 
 class DualAnchorTracker:
-    def __init__(self): self._initialized = False
-    def reset(self, p1, p2, fg, fh, fw): self._initialized = True
-    def update(self, fg, yolo=None, fh=None, fw=None): return None
-    def get_p1_y_norm(self): return None
+    """
+    P1 hip 앵커 + P2 hip 앵커를 LK 광학흐름으로 독립 추적.
+    두 점의 유클리드 거리 → 정규화 거리 (0~1, frame 대각선 기준) 반환.
+    추적 실패 or MAX_DRIFT 초과 → YOLO 재초기화.
+    """
+
+    PATCH_SIZE     = 48    # 앵커당 GoodFeaturesToTrack 패치 크기
+    MIN_VALID_PTS  = 3     # 앵커당 최소 추적점 수
+    MAX_Y_JUMP     = 0.20  # 앵커당 프레임간 최대 y 이동 (정규화)
+    MAX_DRIFT      = 0.30  # 앵커당 초기화 이후 누적 최대 이동 (정규화 대각선)
+    REINIT_FRAMES  = 45    # YOLO로 앵커 재확인 주기 (프레임)
+
+    LK_PARAMS = dict(
+        winSize=(19, 19),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 0.03)
+    )
+    GFT_PARAMS = dict(
+        maxCorners=12,
+        qualityLevel=0.01,
+        minDistance=4,
+        blockSize=5
+    )
+
+    def __init__(self):
+        self._prev_gray    = None
+        self._pts1         = None   # P1 앵커 추적점 (N,1,2)
+        self._pts2         = None   # P2 앵커 추적점 (N,1,2)
+        self._anchor1      = None   # P1 현재 중심 (x, y) 픽셀
+        self._anchor2      = None   # P2 현재 중심 (x, y) 픽셀
+        self._anchor1_init = None   # P1 초기화 시 중심
+        self._anchor2_init = None   # P2 초기화 시 중심
+        self._frame_count  = 0
+        self._initialized  = False
+        self._frame_diag   = 1.0
+
+    def reset(self, p1_hip_px, p2_hip_px, frame_gray, frame_h, frame_w):
+        """
+        앵커 초기화. p1_hip_px, p2_hip_px: (x, y) 픽셀 좌표.
+        """
+        self._frame_diag = float(np.sqrt(frame_h**2 + frame_w**2))
+        self._frame_count = 0
+        self._initialized = False
+        self._frame_h = frame_h
+
+        # 수동 P2 앵커 누락 시 P1 추적만이라도 되도록 fallback 처리
+        pts1 = self._init_anchor(frame_gray, p1_hip_px, frame_h, frame_w) if p1_hip_px else None
+        pts2 = self._init_anchor(frame_gray, p2_hip_px, frame_h, frame_w) if p2_hip_px else None
+
+        if pts1 is not None:
+            self._pts1 = pts1
+            self._anchor1 = self._anchor1_init = (
+                float(np.median(pts1[:, 0, 0])), float(np.median(pts1[:, 0, 1]))
+            )
+            self._prev_gray = frame_gray
+            self._initialized = True
+            
+        if pts2 is not None:
+            self._pts2 = pts2
+            self._anchor2 = self._anchor2_init = (
+                float(np.median(pts2[:, 0, 0])), float(np.median(pts2[:, 0, 1]))
+            )
+
+    def update(self, frame_gray, yolo_result=None, frame_h=None, frame_w=None):
+        """
+        반환: 정규화 거리 (0~1) or None
+        """
+        if not self._initialized or self._prev_gray is None:
+            return None
+
+        self._frame_count += 1
+
+        # REINIT_FRAMES 마다 YOLO로 앵커 재확인
+        if (self._frame_count % self.REINIT_FRAMES == 0
+                and yolo_result is not None and frame_h and frame_w):
+            p1_px, p2_px = self._extract_hip_px(yolo_result)
+            if p1_px and p2_px:
+                self.reset(p1_px, p2_px, frame_gray, frame_h, frame_w)
+                return self._current_dist()
+
+        # LK 추적
+        pts1_new = self._track_pts(self._prev_gray, frame_gray, self._pts1)
+        pts2_new = self._track_pts(self._prev_gray, frame_gray, self._pts2)
+
+        if pts1_new is None:
+            self._initialized = False
+            return None
+
+        a1 = (float(np.median(pts1_new[:, 0, 0])), float(np.median(pts1_new[:, 0, 1])))
+        if pts2_new is not None:
+            a2 = (float(np.median(pts2_new[:, 0, 0])), float(np.median(pts2_new[:, 0, 1])))
+        else:
+            a2 = None
+
+        # 과도한 drift 감지 → 재초기화 필요 신호
+        if self._anchor1_init:
+            drift1 = np.sqrt((a1[0]-self._anchor1_init[0])**2 + (a1[1]-self._anchor1_init[1])**2)
+            if drift1 / self._frame_diag > self.MAX_DRIFT:
+                self._initialized = False
+                return None
+                
+        if self._anchor2_init and a2:
+            drift2 = np.sqrt((a2[0]-self._anchor2_init[0])**2 + (a2[1]-self._anchor2_init[1])**2)
+            if drift2 / self._frame_diag > self.MAX_DRIFT:
+                a2 = None # P2 유실 처리, P1만 유지
+
+        self._pts1    = pts1_new
+        self._pts2    = pts2_new
+        self._anchor1 = a1
+        self._anchor2 = a2
+        self._prev_gray = frame_gray
+
+        return self._current_dist()
+
+    def get_anchor_pixels(self):
+        """디버그 오버레이용 현재 앵커 픽셀 반환."""
+        return self._anchor1, self._anchor2
+        
+    def get_p1_y_norm(self):
+        """YOLO fallback용 y좌표 정규화 반환"""
+        if self._anchor1 and hasattr(self, '_frame_h'):
+            return self._anchor1[1] / self._frame_h
+        return None
+
+    # ── private ────────────────────────────────────────────────────────────
+
+    def _init_anchor(self, frame_gray, hip_px, frame_h, frame_w):
+        cx, cy = int(hip_px[0]), int(hip_px[1])
+        half = self.PATCH_SIZE // 2
+        x1, x2 = max(0, cx - half), min(frame_w, cx + half)
+        y1, y2 = max(0, cy - half), min(frame_h, cy + half)
+        patch = frame_gray[y1:y2, x1:x2]
+        if patch.size == 0 or x2 <= x1 or y2 <= y1:
+            return None
+        pts = cv2.goodFeaturesToTrack(patch, **self.GFT_PARAMS)
+        if pts is None or len(pts) < self.MIN_VALID_PTS:
+            return None
+        pts[:, 0, 0] += x1
+        pts[:, 0, 1] += y1
+        return pts
+
+    def _track_pts(self, prev_gray, cur_gray, pts):
+        if pts is None or len(pts) < self.MIN_VALID_PTS:
+            return None
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, cur_gray, pts, None, **self.LK_PARAMS
+        )
+        if next_pts is None:
+            return None
+        good = status.ravel() == 1
+        if good.sum() < self.MIN_VALID_PTS:
+            return None
+        return next_pts[good].reshape(-1, 1, 2)
+
+    def _current_dist(self):
+        if self._anchor1 is None or self._anchor2 is None:
+            return None
+        dx = self._anchor1[0] - self._anchor2[0]
+        dy = self._anchor1[1] - self._anchor2[1]
+        return float(np.sqrt(dx*dx + dy*dy)) / self._frame_diag
+
+    def _extract_hip_px(self, yolo_result):
+        kp1 = yolo_result.get('keypoints')
+        kp2 = yolo_result.get('secondary_keypoints')
+        p1 = p2 = None
+        if kp1 is not None and len(kp1) > 12:
+            lh, rh = kp1[11], kp1[12]
+            if lh[2] > 0.30 and rh[2] > 0.30:
+                p1 = ((lh[0]+rh[0])/2, (lh[1]+rh[1])/2)
+        if kp2 is not None and len(kp2) > 12:
+            lh2, rh2 = kp2[11], kp2[12]
+            if lh2[2] > 0.30 and rh2[2] > 0.30:
+                p2 = ((lh2[0]+rh2[0])/2, (lh2[1]+rh2[1])/2)
+        return p1, p2
 
 class MotionExtractor:
     def __init__(self, flow_estimator):
