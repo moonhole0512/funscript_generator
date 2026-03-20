@@ -47,12 +47,17 @@ class PositionEstimator:
     def __init__(self, fps):
         self.fps = fps
 
-    def velocity_to_position(self, velocity_signal, segments=None, scene_boundaries=None):
-        """
+    def velocity_to_position(self, velocity_signal, segments, scene_boundaries=None, bypass_hpf=False):
+        """velocity(cumsum) -> High-Pass Filter -> Position.
         Convert velocity signal to drift-free position signal.
         When scene_boundaries is provided, each scene is filtered independently
         to prevent cross-scene contamination of the Butterworth filter state.
         """
+        if bypass_hpf:
+            # Special mode: velocity_signal IS actually the raw position (e.g. from manual anchor)
+            return np.array(velocity_signal, dtype=np.float64)
+        
+        n = len(velocity_signal)
         if len(velocity_signal) < 10:
             return np.zeros(len(velocity_signal))
 
@@ -175,8 +180,8 @@ class PositionEstimator:
 
         median_range = np.median(active_ranges) if active_ranges else 1.0
 
-        p_low = config.get("normalization", "percentile_low", 2)
-        p_high = config.get("normalization", "percentile_high", 98)
+        p_low = config.get("normalization", "percentile_low", 1) # Lowered from 2
+        p_high = config.get("normalization", "percentile_high", 99) # Increased from 98
 
         for start, end, seg_type in segments:
             end = min(end, len(position_signal))
@@ -266,13 +271,13 @@ class PositionEstimator:
             range_used = p95 - p5
 
             if range_used < 20 and (p5 > 65 or p95 < 35):
-                local_strength = 0.5
+                local_strength = 0.3 # Softened
             elif range_used > 70:
-                local_strength = 2.0
+                local_strength = 1.2 # Softened from 2.0
             elif range_used > 40:
-                local_strength = 3.0
+                local_strength = 1.8 # Softened from 3.0
             else:
-                local_strength = 4.0
+                local_strength = 2.5 # Softened from 4.0
 
             centered = (seg - 50.0) / 50.0
             if abs(np.tanh(local_strength)) > 1e-10:

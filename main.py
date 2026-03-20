@@ -20,6 +20,8 @@ from algorithms import (
     ContactPointTracker,
     SceneAnchorSelector,
     DualAnchorTracker,
+    FrameCadenceDetector,
+    TemporalInterpolator,
     YOLO_AVAILABLE,
     DEVICE,
     RESIZE_WIDTH
@@ -112,7 +114,8 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
                         frame_idx, fps, bbox=None, keypoints=None,
                         secondary_hip_y=None, secondary_bbox=None, rel_dist=None,
                         secondary_keypoints=None, scene_type=None,
-                        anchor_p1=None, anchor_p2=None, anchor_dist=None):
+                        anchor_p1=None, anchor_p2=None, anchor_dist=None,
+                        anchor_is_manual=False):
     """
     ROI 박스 + velocity 방향 바 + zoom 상태를 프레임 위에 그려 JPEG base64로 반환.
     - ROI: 밝은 라임 그린 (#00FF80)
@@ -274,8 +277,10 @@ def _draw_debug_overlay(frame_bgr, current_roi, velocity, magnitude, zoom_detect
         cv2.line(vis, (ax1, ay1 - 12), (ax1, ay1 + 12), (0, 0, 255), 2)
         cv2.circle(vis, (ax1, ay1), 3, (255, 255, 255), -1)
         # 상단에 강조 텍스트
-        cv2.putText(vis, "MANUAL HIP ACTIVE", (w // 2 - 75, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        status_txt = "MANUAL ANCHOR" if anchor_is_manual else "AUTO ANCHOR"
+        status_color = (0, 0, 255) if anchor_is_manual else (255, 255, 0) # Red if manual, Cyan-ish yellow if auto
+        cv2.putText(vis, status_txt, (w // 2 - 75, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2, cv2.LINE_AA)
 
     if anchor_p2 is not None:
         ax2, ay2 = int(anchor_p2[0]), int(anchor_p2[1])
@@ -461,23 +466,23 @@ def _normalize_stroke_amplitude(actions: list,
 
 
 def _blend_yolo_pose(velocity_flow, yolo_hip_ys, yolo_ref_lens, yolo_confs,
-                     min_conf=0.5):
+                     min_conf=0.5, psp=None):
     """
     YOLO hip_y 미분 → velocity로 변환하여 optical flow velocity와 혼합.
-
-    신뢰도 >= min_conf 프레임: YOLO velocity 우선 (신뢰도 가중 혼합)
-    신뢰도 < min_conf 프레임: optical flow 그대로 유지
-
-    scale 자동 맞춤: YOLO 신호를 flow 진폭에 맞춰 정규화.
+    psp: Personalized Skeleton Profile (avg_ref 사용)
     """
     n = len(velocity_flow)
     conf_arr = np.array([c if c is not None else 0.0 for c in yolo_confs],
                         dtype=np.float64)
 
     yolo_vel = np.zeros(n, dtype=np.float64)
+    avg_ref = psp['p1_avg_ref'] if psp and psp.get('p1_avg_ref') else 0.15
+    
     for i in range(1, n):
         hy_c, hy_p = yolo_hip_ys[i], yolo_hip_ys[i - 1]
-        rl = yolo_ref_lens[i]
+        # Use PSP avg_ref if current ref_len is missing or low confidence
+        rl = yolo_ref_lens[i] if yolo_ref_lens[i] and yolo_ref_lens[i] > 0.04 else avg_ref
+        
         if hy_c is not None and hy_p is not None and rl and rl > 0.04:
             yolo_vel[i] = -(hy_c - hy_p) / rl  # 위로 이동 = 양수 (stroke in)
 
@@ -746,7 +751,7 @@ def _blend_anchor_dist(velocity_flow: np.ndarray,
     n = len(velocity_flow)
     valid_mask = np.array([d is not None for d in anchor_dists], dtype=bool)
 
-    if valid_mask.sum() < n * 0.30:
+    if valid_mask.sum() < n * 0.10: # Lowered from 0.30 to trust manual tracking more
         return velocity_flow
 
     dist_arr = np.array([d if d is not None else np.nan for d in anchor_dists],
@@ -1001,6 +1006,30 @@ def pass1_analyze(video_path: str, progress_callback=None):
     )
 
 
+def _blend_signals_weighted(velocity_flow, signals_dict, fps):
+    """
+    여러 모션 신호를 신뢰도 기반으로 혼합.
+    signals_dict: { 'name': {'vel': ndarray, 'weight': float, 'mask': ndarray}, ... }
+    """
+    n = len(velocity_flow)
+    total_vel = velocity_flow.copy()
+    total_weight = np.ones(n, dtype=np.float64) * 0.1  # Flow 기본 가중치
+
+    for name, data in signals_dict.items():
+        vel = data['vel']
+        weight = data['weight']
+        mask = data['mask']
+        
+        if vel is None or len(vel) != n:
+            continue
+            
+        # 가중치 적용 (mask가 True인 구간만)
+        total_vel[mask] += vel[mask] * weight
+        total_weight[mask] += weight
+
+    return total_vel / total_weight
+
+
 def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                   progress_callback=None, frame_callback=None) -> bool:
     """Pass 2: 모션 추출 + funscript 생성. user_config 반영.
@@ -1035,6 +1064,8 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     # ── Phase 3: Sequential motion extraction with dynamic ROI tracking ──
     motion_extractor = MotionExtractor(flow_estimator)
     roi_tracker = DynamicROITracker(fps)
+    cadence_detector = FrameCadenceDetector()
+    interpolator = TemporalInterpolator()
 
     initial_roi = _get_roi_for_frame(0, scene_boundaries, per_scene_rois)
     roi_tracker.reset(initial_roi)
@@ -1146,8 +1177,11 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                 if sc2.p1_hip_px is not None:
                     frame_gray_tmp = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
                     anchor_tracker.reset(sc2.p1_hip_px, sc2.p2_hip_px,
-                                         frame_gray_tmp, frame_h, frame_w)
+                                         frame_gray_tmp, frame_h, frame_w, is_manual=True)
                     anchor_initialized = True
+
+        # ── Animation Cadence Handling ──
+        is_dup = cadence_detector.is_duplicate(prev_frame, frame_resized)
 
         flow = flow_estimator.estimate_flow(prev_frame, frame_resized)
         current_roi = roi_tracker.update(flow, frame_h, frame_w)
@@ -1155,6 +1189,9 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         velocity, magnitude, _, zoom_detected = motion_extractor.extract_velocity_signal(
             prev_frame, frame_resized, current_roi, precomputed_flow=flow
         )
+
+        # Interpolate if duplicate (animation "on-twos")
+        velocity = interpolator.update(velocity, is_dup)
 
         velocity_signal.append(velocity)
         magnitude_signal.append(magnitude)
@@ -1189,7 +1226,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             cpx, cpy = _compute_contact_pixel(yolo_result, frame_h, frame_w)
         else:
             cpx, cpy = None, None
-        contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w)
+        contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w, is_duplicate=is_dup)
         contact_ys.append(contact_y)
 
         if not anchor_initialized:
@@ -1198,7 +1235,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             if si < len(cfg.scene_configs) and cfg.scene_configs[si].p1_hip_px is not None:
                 sc2 = cfg.scene_configs[si]
                 anchor_tracker.reset(sc2.p1_hip_px, sc2.p2_hip_px,
-                                     frame_gray, frame_h, frame_w)
+                                     frame_gray, frame_h, frame_w, is_manual=True)
                 anchor_initialized = True
             else:
                 anchor_info = per_scene_anchors[si] if si < len(per_scene_anchors) else None
@@ -1210,12 +1247,12 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                                  anchor_info['p1_hip_px'][1] * scale_y)
                     p2_scaled = (anchor_info['p2_hip_px'][0] * scale_x,
                                  anchor_info['p2_hip_px'][1] * scale_y)
-                    anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w)
+                    anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w, is_manual=False)
                     anchor_initialized = True
 
         anchor_dist = None
         if anchor_initialized:
-            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w)
+            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w, is_duplicate=is_dup)
             if anchor_dist is None:
                 anchor_initialized = False
         anchor_dists.append(anchor_dist)
@@ -1257,6 +1294,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                     anchor_p1=_anc1,
                     anchor_p2=_anc2,
                     anchor_dist=anchor_dist,
+                    anchor_is_manual=anchor_tracker.is_manual() if anchor_initialized else False
                 )
                 frame_callback(b64, {
                     'type': 'frame',
@@ -1279,45 +1317,98 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         print("Error: Not enough frames processed")
         return False
 
-    has_yolo = yolo_tracker is not None and len(yolo_hip_ys) == len(velocity_signal)
+    # ── Phase 4: Dynamic Reliability-Weighted Blending ──
+    has_yolo = (yolo_tracker is not None and len(yolo_hip_ys) == len(velocity_signal))
+    psp = yolo_tracker.get_psp() if has_yolo else None
 
-    dual_coverage = (sum(yolo_is_duals) / max(len(yolo_is_duals), 1)
-                     if yolo_is_duals else 0.0)
-    print(f"Dual mode coverage: {dual_coverage:.1%}")
+    # Coverage statistics
+    if len(yolo_is_duals) > 0:
+        dual_coverage = sum(yolo_is_duals) / len(yolo_is_duals)
+    else:
+        dual_coverage = 0.0
+        
+    if len(anchor_dists) > 0:
+        anchor_coverage = sum(1 for d in anchor_dists if d is not None) / len(anchor_dists)
+    else:
+        anchor_coverage = 0.0
+        
+    if len(contact_ys) > 0:
+        contact_coverage = sum(1 for y in contact_ys if y is not None) / len(contact_ys)
+    else:
+        contact_coverage = 0.0
 
-    contact_coverage = (sum(1 for y in contact_ys if y is not None) / max(len(contact_ys), 1)
-                        if contact_ys else 0.0)
-    print(f"LK contact tracking coverage: {contact_coverage:.1%}")
+    # 각 신호별 독립 Velocity 계산 및 가중치 준비
+    signals_to_blend = {}
 
-    st_arr  = np.array(scene_types) if scene_types else np.array([])
-    bj_mask = (st_arr == 'BJ')
-    bj_coverage = float(bj_mask.sum()) / max(len(st_arr), 1)
-    print(f"Scene coverage — BJ: {bj_coverage:.1%}")
+    # 1. YOLO Pose (Single)
+    if has_yolo:
+        yolo_v = np.zeros_like(velocity_signal)
+        avg_ref = psp['p1_avg_ref'] if psp else 0.15
+        for idx_v in range(1, len(yolo_v)):
+            hy_c, hy_p = yolo_hip_ys[idx_v], yolo_hip_ys[idx_v-1]
+            rl = yolo_ref_lens[idx_v] if yolo_ref_lens[idx_v] and yolo_ref_lens[idx_v] > 0.04 else avg_ref
+            if hy_c is not None and hy_p is not None:
+                yolo_v[idx_v] = -(hy_c - hy_p) / rl
+        
+        # Scale to flow
+        conf_arr = np.array([c if c is not None else 0.0 for c in yolo_confs])
+        pose_mask = conf_arr > 0.4
+        if pose_mask.sum() > 15:
+            pose_scale = _estimate_dual_scale(velocity_signal, yolo_v, pose_mask)
+            if pose_scale and pose_scale > 0:
+                signals_to_blend['pose'] = {'vel': yolo_v * pose_scale, 'weight': 0.8, 'mask': pose_mask}
 
-    anchor_coverage = (sum(1 for d in anchor_dists if d is not None) / max(len(anchor_dists), 1)
-                       if anchor_dists else 0.0)
-    print(f"Dual anchor tracking coverage: {anchor_coverage:.1%}")
+    # 2. BJ (Head-Hip)
+    bj_mask = (np.array(scene_types) == 'BJ')
+    if bj_mask.sum() > 15:
+        bj_v = np.zeros_like(velocity_signal)
+        d_arr = np.array([d if d is not None else np.nan for d in head_hip_dists])
+        for idx_v in range(1, len(bj_v)):
+            if not np.isnan(d_arr[idx_v]) and not np.isnan(d_arr[idx_v-1]):
+                bj_v[idx_v] = -(d_arr[idx_v] - d_arr[idx_v-1])
+        bj_scale = _estimate_dual_scale(velocity_signal, bj_v, bj_mask)
+        if bj_scale and bj_scale > 0:
+            signals_to_blend['bj'] = {'vel': bj_v * bj_scale, 'weight': 1.2, 'mask': bj_mask}
 
-    if (contact_coverage >= 0.40 and len(contact_ys) == len(velocity_signal)
-            and dual_coverage >= 0.30):
-        velocity_signal = _blend_contact_tracking(velocity_signal, contact_ys, yolo_is_duals)
-        print("Using LK contact point tracking signal")
-    elif (anchor_coverage >= 0.30 and len(anchor_dists) == len(velocity_signal)):
-        velocity_signal = _blend_anchor_dist(velocity_signal, anchor_dists)
-        print(f"Using dual-anchor LK distance signal ({anchor_coverage:.1%} coverage)")
-    elif (bj_coverage >= 0.25 and len(head_hip_dists) == len(velocity_signal)
-          and len(st_arr) == len(velocity_signal)):
-        velocity_signal = _blend_bj_pose(velocity_signal, head_hip_dists, bj_mask)
-        print(f"Using BJ head-hip distance signal ({bj_coverage:.1%} coverage)")
-    elif dual_coverage >= 0.50 and len(yolo_rel_dists) == len(velocity_signal):
-        velocity_signal = _blend_dual_pose(velocity_signal, yolo_rel_dists, yolo_is_duals)
-        print("Using dual-person relative distance signal")
-    elif has_yolo:
-        velocity_signal = _blend_yolo_pose(
-            velocity_signal, yolo_hip_ys, yolo_ref_lens, yolo_confs
-        )
-        yolo_confident = sum(1 for c in yolo_confs if c and c > 0.5)
-        print(f"Pose blend (YOLO-only): {yolo_confident} high-conf frames")
+    # 3. Dual Person (YOLO relative)
+    dual_mask = np.array([bool(b) for b in yolo_is_duals])
+    if dual_mask.sum() > 15:
+        dual_v = np.zeros_like(velocity_signal)
+        d_arr = np.array([d if d is not None else np.nan for d in yolo_rel_dists])
+        for idx_v in range(1, len(dual_v)):
+            if not np.isnan(d_arr[idx_v]) and not np.isnan(d_arr[idx_v-1]):
+                dual_v[idx_v] = -(d_arr[idx_v] - d_arr[idx_v-1])
+        dual_scale = _estimate_dual_scale(velocity_signal, dual_v, dual_mask)
+        if dual_scale and dual_scale > 0:
+            signals_to_blend['dual'] = {'vel': dual_v * dual_scale, 'weight': 1.5, 'mask': dual_mask}
+
+    # 4. Dual Anchor (LK)
+    anchor_mask_arr = np.array([d is not None for d in anchor_dists])
+    if anchor_mask_arr.sum() > 15:
+        anc_v = np.zeros_like(velocity_signal)
+        d_arr = np.array([d if d is not None else np.nan for d in anchor_dists])
+        for idx_v in range(1, len(anc_v)):
+            if not np.isnan(d_arr[idx_v]) and not np.isnan(d_arr[idx_v-1]):
+                anc_v[idx_v] = -(d_arr[idx_v] - d_arr[idx_v-1])
+        anc_scale = _estimate_dual_scale(velocity_signal, anc_v, anchor_mask_arr)
+        if anc_scale and anc_scale > 0:
+            signals_to_blend['anchor'] = {'vel': anc_v * anc_scale, 'weight': 2.5, 'mask': anchor_mask_arr}
+
+    # 5. LK Contact
+    contact_mask_arr = (np.array([y is not None for y in contact_ys]) & dual_mask)
+    if contact_mask_arr.sum() > 15:
+        con_v = np.zeros_like(velocity_signal)
+        y_arr = np.array([y if y is not None else np.nan for y in contact_ys])
+        for idx_v in range(1, len(con_v)):
+            if not np.isnan(y_arr[idx_v]) and not np.isnan(y_arr[idx_v-1]):
+                con_v[idx_v] = -(y_arr[idx_v] - y_arr[idx_v-1])
+        con_scale = _estimate_dual_scale(velocity_signal, con_v, contact_mask_arr)
+        if con_scale and con_scale > 0:
+            signals_to_blend['contact'] = {'vel': con_v * con_scale, 'weight': 3.5, 'mask': contact_mask_arr}
+
+    # 최종 가중치 혼합
+    velocity_signal = _blend_signals_weighted(velocity_signal, signals_to_blend, fps)
+    print(f"Blended {len(signals_to_blend)} signals: {list(signals_to_blend.keys())}")
 
     if quality_records and len(quality_records) == len(velocity_signal):
         quality_mask = _build_quality_mask(quality_records)
@@ -1570,6 +1661,8 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
     # ── Phase 3: Sequential motion extraction with dynamic ROI tracking ──
     motion_extractor = MotionExtractor(flow_estimator)
     roi_tracker = DynamicROITracker(fps)
+    cadence_detector = FrameCadenceDetector()
+    interpolator = TemporalInterpolator()
 
     initial_roi = _get_roi_for_frame(0, scene_boundaries, per_scene_rois)
     roi_tracker.reset(initial_roi)
@@ -1632,12 +1725,18 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
             contact_tracker.reset()
             anchor_initialized = False
 
+        # ── Animation Cadence Handling ──
+        is_dup = cadence_detector.is_duplicate(prev_frame, frame_resized)
+
         flow = flow_estimator.estimate_flow(prev_frame, frame_resized)
         current_roi = roi_tracker.update(flow, frame_h, frame_w)
 
         velocity, magnitude, _, zoom_detected = motion_extractor.extract_velocity_signal(
             prev_frame, frame_resized, current_roi, precomputed_flow=flow
         )
+
+        # Interpolate if duplicate (animation "on-twos")
+        velocity = interpolator.update(velocity, is_dup)
 
         velocity_signal.append(velocity)
         magnitude_signal.append(magnitude)
@@ -1679,7 +1778,7 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
             cpx, cpy = _compute_contact_pixel(yolo_result, frame_h, frame_w)
         else:
             cpx, cpy = None, None
-        contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w)
+        contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w, is_duplicate=is_dup)
         contact_ys.append(contact_y)
 
         # ── DualAnchorTracker (LK 두 점 독립 추적) ──
@@ -1694,12 +1793,12 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
                              anchor_info['p1_hip_px'][1] * scale_y)
                 p2_scaled = (anchor_info['p2_hip_px'][0] * scale_x,
                              anchor_info['p2_hip_px'][1] * scale_y)
-                anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w)
+                anchor_tracker.reset(p1_scaled, p2_scaled, frame_gray, frame_h, frame_w, is_manual=False)
                 anchor_initialized = True
 
         anchor_dist = None
         if anchor_initialized:
-            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w)
+            anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w, is_duplicate=is_dup)
             if anchor_dist is None:
                 anchor_initialized = False
         anchor_dists.append(anchor_dist)
@@ -1725,6 +1824,7 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
                     anchor_p1=_anc1,
                     anchor_p2=_anc2,
                     anchor_dist=anchor_dist,
+                    anchor_is_manual=anchor_tracker.is_manual() if anchor_initialized else False
                 )
                 frame_callback(b64, {
                     'type': 'frame',
@@ -1747,49 +1847,86 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
         print("Error: Not enough frames processed")
         return False
 
-    # ── Phase 4: YOLO Pose-flow blending ──
-    has_yolo = yolo_tracker is not None and len(yolo_hip_ys) == len(velocity_signal)
+    # ── Phase 4: Dynamic Reliability-Weighted Blending ──
+    has_yolo = (yolo_tracker is not None and len(yolo_hip_ys) == len(velocity_signal))
+    psp = yolo_tracker.get_psp() if has_yolo else None
 
-    # dual 모드 우선: 두 골반 상대 거리 신호
-    dual_coverage = (sum(yolo_is_duals) / max(len(yolo_is_duals), 1)
-                     if yolo_is_duals else 0.0)
-    print(f"Dual mode coverage: {dual_coverage:.1%}")
+    # Coverage statistics
+    if len(yolo_is_duals) > 0:
+        dual_coverage = sum(yolo_is_duals) / len(yolo_is_duals)
+    else:
+        dual_coverage = 0.0
+        
+    if len(anchor_dists) > 0:
+        anchor_coverage = sum(1 for d in anchor_dists if d is not None) / len(anchor_dists)
+    else:
+        anchor_coverage = 0.0
+        
+    if len(contact_ys) > 0:
+        contact_coverage = sum(1 for y in contact_ys if y is not None) / len(contact_ys)
+    else:
+        contact_coverage = 0.0
 
-    # LK 접촉점 우선 (dual 영상에서 40%+ 추적 성공 시)
-    contact_coverage = (sum(1 for y in contact_ys if y is not None) / max(len(contact_ys), 1)
-                        if contact_ys else 0.0)
-    print(f"LK contact tracking coverage: {contact_coverage:.1%}")
+    # 각 신호별 독립 Velocity 계산 및 가중치 준비
+    signals_to_blend = {}
 
-    # scene_type 배열 → BJ 마스크 생성
-    st_arr  = np.array(scene_types) if scene_types else np.array([])
-    bj_mask = (st_arr == 'BJ')
-    bj_coverage = float(bj_mask.sum()) / max(len(st_arr), 1)
-    print(f"Scene coverage — BJ: {bj_coverage:.1%}")
+    # 1. YOLO Pose (Single)
+    if has_yolo:
+        yolo_v = np.zeros_like(velocity_signal)
+        avg_ref = psp['p1_avg_ref'] if psp else 0.15
+        for idx_v in range(1, len(yolo_v)):
+            hy_c, hy_p = yolo_hip_ys[idx_v], yolo_hip_ys[idx_v-1]
+            rl = yolo_ref_lens[idx_v] if yolo_ref_lens[idx_v] and yolo_ref_lens[idx_v] > 0.04 else avg_ref
+            if hy_c is not None and hy_p is not None:
+                yolo_v[idx_v] = -(hy_c - hy_p) / rl
+        
+        # Scale to flow
+        conf_arr = np.array([c if c is not None else 0.0 for c in yolo_confs])
+        pose_mask = conf_arr > 0.4
+        if pose_mask.sum() > 15:
+            pose_scale = _estimate_dual_scale(velocity_signal, yolo_v, pose_mask)
+            if pose_scale and pose_scale > 0:
+                signals_to_blend['pose'] = {'vel': yolo_v * pose_scale, 'weight': 0.8, 'mask': pose_mask}
 
-    anchor_coverage = (sum(1 for d in anchor_dists if d is not None) / max(len(anchor_dists), 1)
-                       if anchor_dists else 0.0)
-    print(f"Dual anchor tracking coverage: {anchor_coverage:.1%}")
+    # 2. Dual Person (YOLO relative)
+    dual_mask = np.array([bool(b) for b in yolo_is_duals])
+    if dual_mask.sum() > 15:
+        dual_v = np.zeros_like(velocity_signal)
+        d_arr = np.array([d if d is not None else np.nan for d in yolo_rel_dists])
+        for idx_v in range(1, len(dual_v)):
+            if not np.isnan(d_arr[idx_v]) and not np.isnan(d_arr[idx_v-1]):
+                dual_v[idx_v] = -(d_arr[idx_v] - d_arr[idx_v-1])
+        dual_scale = _estimate_dual_scale(velocity_signal, dual_v, dual_mask)
+        if dual_scale and dual_scale > 0:
+            signals_to_blend['dual'] = {'vel': dual_v * dual_scale, 'weight': 1.5, 'mask': dual_mask}
 
-    if (contact_coverage >= 0.40 and len(contact_ys) == len(velocity_signal)
-            and dual_coverage >= 0.30):
-        velocity_signal = _blend_contact_tracking(velocity_signal, contact_ys, yolo_is_duals)
-        print("Using LK contact point tracking signal")
-    elif (anchor_coverage >= 0.30 and len(anchor_dists) == len(velocity_signal)):
-        velocity_signal = _blend_anchor_dist(velocity_signal, anchor_dists)
-        print(f"Using dual-anchor LK distance signal ({anchor_coverage:.1%} coverage)")
-    elif (bj_coverage >= 0.25 and len(head_hip_dists) == len(velocity_signal)
-          and len(st_arr) == len(velocity_signal)):
-        velocity_signal = _blend_bj_pose(velocity_signal, head_hip_dists, bj_mask)
-        print(f"Using BJ head-hip distance signal ({bj_coverage:.1%} coverage)")
-    elif dual_coverage >= 0.50 and len(yolo_rel_dists) == len(velocity_signal):
-        velocity_signal = _blend_dual_pose(velocity_signal, yolo_rel_dists, yolo_is_duals)
-        print("Using dual-person relative distance signal")
-    elif has_yolo:
-        velocity_signal = _blend_yolo_pose(
-            velocity_signal, yolo_hip_ys, yolo_ref_lens, yolo_confs
-        )
-        yolo_confident = sum(1 for c in yolo_confs if c and c > 0.5)
-        print(f"Pose blend (YOLO-only): {yolo_confident} high-conf frames")
+    # 3. Dual Anchor (LK)
+    anchor_mask_arr = np.array([d is not None for d in anchor_dists])
+    if anchor_mask_arr.sum() > 15:
+        anc_v = np.zeros_like(velocity_signal)
+        d_arr = np.array([d if d is not None else np.nan for d in anchor_dists])
+        for idx_v in range(1, len(anc_v)):
+            if not np.isnan(d_arr[idx_v]) and not np.isnan(d_arr[idx_v-1]):
+                anc_v[idx_v] = -(d_arr[idx_v] - d_arr[idx_v-1])
+        anc_scale = _estimate_dual_scale(velocity_signal, anc_v, anchor_mask_arr)
+        if anc_scale and anc_scale > 0:
+            signals_to_blend['anchor'] = {'vel': anc_v * anc_scale, 'weight': 2.5, 'mask': anchor_mask_arr}
+
+    # 4. LK Contact
+    contact_mask_arr = (np.array([y is not None for y in contact_ys]) & dual_mask)
+    if contact_mask_arr.sum() > 15:
+        con_v = np.zeros_like(velocity_signal)
+        y_arr = np.array([y if y is not None else np.nan for y in contact_ys])
+        for idx_v in range(1, len(con_v)):
+            if not np.isnan(y_arr[idx_v]) and not np.isnan(y_arr[idx_v-1]):
+                con_v[idx_v] = -(y_arr[idx_v] - y_arr[idx_v-1])
+        con_scale = _estimate_dual_scale(velocity_signal, con_v, contact_mask_arr)
+        if con_scale and con_scale > 0:
+            signals_to_blend['contact'] = {'vel': con_v * con_scale, 'weight': 3.5, 'mask': contact_mask_arr}
+
+    # 최종 가중치 혼합
+    velocity_signal = _blend_signals_weighted(velocity_signal, signals_to_blend, fps)
+    print(f"Blended {len(signals_to_blend)} signals: {list(signals_to_blend.keys())}")
 
     # ── 품질 메타데이터 기반 velocity 후처리 ──
     if quality_records and len(quality_records) == len(velocity_signal):
@@ -1815,7 +1952,7 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
 
     # Minimal smoothing on velocity before segmentation and integration
     if len(velocity_signal) > 5:
-        velocity_smoothed = savgol_filter(velocity_signal, 5, 1)
+        velocity_smoothed = savgol_filter(velocity_signal, 5, 1) # Window restored to 5
     else:
         velocity_smoothed = velocity_signal
 
@@ -1851,15 +1988,31 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
 
     position_estimator = PositionEstimator(fps)
 
-    # G1 (직접 위치 경로): 비활성화
-    # 이유: hip_y 절대 좌표는 funscript 위치와 범용적 1:1 대응 불가.
-    # 스크립터마다 다른 기준점 → Librarian composite 0.7660→0.4816 catastrophic regression 확인.
-    # 기존 경로: velocity → cumsum → HPF
-    position_raw = position_estimator.velocity_to_position(
-        velocity_smoothed, segments, scene_boundaries=scene_boundaries
-    )
+    use_direct_pos = anchor_tracker.is_manual() and anchor_coverage > 0.5
+    if use_direct_pos:
+        # Interpolate missing frames in anchor_dists
+        d_arr = np.array([d if d is not None else np.nan for d in anchor_dists])
+        valid_idx = np.where(~np.isnan(d_arr))[0]
+        if len(valid_idx) > 10:
+            nan_idx = np.where(np.isnan(d_arr))[0]
+            d_arr[nan_idx] = np.interp(nan_idx, valid_idx, d_arr[valid_idx])
+            position_raw = d_arr
+            print("Using direct anchor position signal (Manual mode)")
+        else:
+            position_raw = position_estimator.velocity_to_position(
+                velocity_smoothed, segments, scene_boundaries=scene_boundaries
+            )
+            use_direct_pos = False
+    else:
+        position_raw = position_estimator.velocity_to_position(
+            velocity_smoothed, segments, scene_boundaries=scene_boundaries
+        )
+
     position_normalized = position_estimator.normalize_per_segment(position_raw, segments)
-    position_normalized = position_estimator.expand_contrast(position_normalized, segments=segments)
+    
+    # Only expand contrast if not in direct manual mode (preserve natural fidelity)
+    if not use_direct_pos:
+        position_normalized = position_estimator.expand_contrast(position_normalized, segments=segments)
 
     # ── Phase 6: Action Point Generation ──
     if progress_callback:
@@ -1884,8 +2037,8 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
     if progress_callback:
         progress_callback(90, 100, "Post-processing...")
 
-    # Stroke 진폭 자동 스트레칭 (씬별 range < 45 → 보정)
-    actions = _normalize_stroke_amplitude(actions, segments, fps, min_range=45)
+    # Stroke 진폭 자동 스트레칭 (Disabled to match personal preference and fidelity)
+    # actions = _normalize_stroke_amplitude(actions, segments, fps, min_range=45)
 
     post_processor = ScriptPostProcessor()
     actions = post_processor.validate_and_fix(actions, max_speed=500)

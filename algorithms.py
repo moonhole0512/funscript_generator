@@ -19,6 +19,8 @@ from tracking import (
     ContactPointTracker,
     DualAnchorTracker,
     MotionExtractor,
+    FrameCadenceDetector,
+    TemporalInterpolator,
     DEVICE,
     RESIZE_WIDTH,
     YOLO_AVAILABLE,

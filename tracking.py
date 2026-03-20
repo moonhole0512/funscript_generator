@@ -23,6 +23,41 @@ except ImportError:
 # Named tuple for affine camera motion estimation result
 AffineResult = namedtuple('AffineResult', ['tx', 'ty', 'scale', 'rotation', 'inlier_ratio', 'bg_std', 'valid'])
 
+class FrameCadenceDetector:
+    """Detects if the video is animated 'on-twos' or 'on-threes' (repeated frames)."""
+    def __init__(self, threshold=0.5):
+        self.threshold = threshold
+        self.history = []
+        self.max_history = 10
+        
+    def is_duplicate(self, img1, img2):
+        """Checks if two frames are identical or near-identical using MSE."""
+        if img1 is None or img2 is None: return False
+        # Calculate MSE on a downsampled version for speed
+        h, w = img1.shape[:2]
+        ds = 4
+        m1 = cv2.resize(img1, (w//ds, h//ds), interpolation=cv2.INTER_NEAREST)
+        m2 = cv2.resize(img2, (w//ds, h//ds), interpolation=cv2.INTER_NEAREST)
+        mse = np.mean((m1.astype(np.float32) - m2.astype(np.float32)) ** 2)
+        return mse < self.threshold
+
+class TemporalInterpolator:
+    """Interpolates motion signals for repeated animation frames."""
+    def __init__(self):
+        self.last_valid_velocity = 0.0
+        self.duplicate_count = 0
+        
+    def update(self, velocity, is_duplicate):
+        if is_duplicate:
+            self.duplicate_count += 1
+            # Maintain previous velocity but slightly decay it to avoid infinite loops
+            # In animations, motion is 'held' or 'stepped'
+            return self.last_valid_velocity * 0.95
+        else:
+            self.duplicate_count = 0
+            self.last_valid_velocity = velocity
+            return velocity
+
 class CameraMotionCompensator:
     """RAFT flow-based camera motion estimation."""
     MIN_BG_PIXELS = 16
@@ -232,6 +267,12 @@ class YoloPoseTracker:
         self._p1_centroid_ema, self._p2_centroid_ema, self._p1_ema_alpha = None, None, 0.15
         self._p1_hint_bbox, self._p2_hint_bbox = None, None
         self._hint_applied = False
+        
+        # PSP: Adaptive Skeleton Proportions
+        self._psp = {
+            'p1': {'ref_lens': deque(maxlen=60), 'avg_ref': 0.15},
+            'p2': {'ref_lens': deque(maxlen=60), 'avg_ref': 0.15}
+        }
 
     def _make_slot(self, cx, cy, bbox=None):
         return {
@@ -253,7 +294,7 @@ class YoloPoseTracker:
         empty = {'hip_center_y': None, 'reference_length': None, 'confidence': 0.0, 'bbox': None, 'keypoints': None, 'secondary_hip_y': None, 'rel_dist': None, 'is_dual': False}
         self._frame_count += 1
         try:
-            res = self._model.track(frame_bgr, persist=True, verbose=False, device=self._device) if self._use_tracking else self._model(frame_bgr, verbose=False, device=self._device)
+            res = self._model.track(frame_bgr, persist=True, verbose=False, device=self._device, tracker="botsort.yaml") if self._use_tracking else self._model(frame_bgr, verbose=False, device=self._device)
         except:
             if self._use_tracking: self._use_tracking = False; res = self._model(frame_bgr, verbose=False, device=self._device)
             else: return empty
@@ -431,6 +472,18 @@ class YoloPoseTracker:
             if s['last_result'] and s['last_result'].get('track_id') is not None:
                 self._track_id_map[s['last_result']['track_id']] = self._slots.index(s)
 
+        # ── PSP Update ──
+        if self._slots and self._slots[0]['last_result']:
+            ref = self._slots[0]['last_result'].get('reference_length')
+            if ref:
+                self._psp['p1']['ref_lens'].append(ref)
+                self._psp['p1']['avg_ref'] = np.median(self._psp['p1']['ref_lens'])
+        if len(self._slots) >= 2 and self._slots[1]['last_result']:
+            ref2 = self._slots[1]['last_result'].get('reference_length')
+            if ref2:
+                self._psp['p2']['ref_lens'].append(ref2)
+                self._psp['p2']['avg_ref'] = np.median(self._psp['p2']['ref_lens'])
+
         if not self._slots or self._slots[0]['last_result'] is None:
             return {'hip_center_y': None, 'reference_length': None, 'confidence': 0.0, 'bbox': None, 'keypoints': None, 'secondary_hip_y': None, 'secondary_bbox': None, 'secondary_keypoints': None, 'rel_dist': None, 'is_dual': False}
         p1 = self._slots[0]['last_result']
@@ -470,27 +523,98 @@ class YoloPoseTracker:
         self._slots.clear()
         self._track_id_map.clear()
 
+    def get_psp(self):
+        """Returns the Personalized Skeleton Profile (PSP) for P1 and P2."""
+        return {
+            'p1_avg_ref': self._psp['p1']['avg_ref'],
+            'p2_avg_ref': self._psp['p2']['avg_ref']
+        }
+
     def close(self):
         """No explicit close needed for Ultralytics YOLO."""
         pass
 
 class ContactPointTracker:
-    def __init__(self): self.reset()
-    def reset(self): self._initialized = False
-    def update(self, frame_gray, contact_px, contact_py, fh, fw): return None
+    """
+    두 인물의 접촉점(골반 중간) 픽셀 패턴을 Lucas-Kanade로 추적.
+    YOLO 탐지 오류에 독립적인 보조 신호 제공.
+    """
+    PATCH_SIZE = 32
+    MIN_VALID_POINTS = 3
+    MAX_Y_JUMP = 0.15
+
+    def __init__(self):
+        self.reset()
+        self.LK_PARAMS = dict(winSize=(15, 15), maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+
+    def reset(self):
+        self._initialized = False
+        self._prev_gray = None
+        self._prev_pts = None
+        self._contact_y = None
+
+    def update(self, frame_gray, contact_px, contact_py, fh, fw, is_duplicate=False):
+        """
+        반환: 추적된 contact_y (정규화 0~1) 또는 None
+        """
+        if is_duplicate:
+            return self._contact_y
+
+        if not self._initialized:
+            if contact_px is not None and contact_py is not None:
+                self._init_tracker(frame_gray, contact_px, contact_py, fh, fw)
+            return None
+
+        # LK 추적
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(self._prev_gray, frame_gray, self._prev_pts, None, **self.LK_PARAMS)
+        
+        good = status.ravel() == 1 if status is not None else np.array([])
+        if status is None or good.sum() < self.MIN_VALID_POINTS:
+            self._initialized = False
+            return None
+
+        new_pts = next_pts[good]
+        new_y_px = np.median(new_pts[:, 0, 1])
+        new_y_norm = new_y_px / fh
+
+        # 급격한 점프 체크
+        if self._contact_y is not None and abs(new_y_norm - self._contact_y) > self.MAX_Y_JUMP:
+            self._initialized = False
+            return None
+
+        self._contact_y = new_y_norm
+        self._prev_pts = new_pts.reshape(-1, 1, 2)
+        self._prev_gray = frame_gray
+        return self._contact_y
+
+    def _init_tracker(self, frame_gray, px, py, fh, fw):
+        half = self.PATCH_SIZE // 2
+        x1, x2 = max(0, int(px - half)), min(fw, int(px + half))
+        y1, y2 = max(0, int(py - half)), min(fh, int(py + half))
+        patch = frame_gray[y1:y2, x1:x2]
+        if patch.size == 0: return
+
+        pts = cv2.goodFeaturesToTrack(patch, maxCorners=20, qualityLevel=0.01, minDistance=3)
+        if pts is not None and len(pts) >= self.MIN_VALID_POINTS:
+            pts[:, 0, 0] += x1
+            pts[:, 0, 1] += y1
+            self._prev_pts = pts
+            self._prev_gray = frame_gray
+            self._initialized = True
+            self._contact_y = py / fh
 
 class DualAnchorTracker:
     """
     P1 hip 앵커 + P2 hip 앵커를 LK 광학흐름으로 독립 추적.
-    두 점의 유클리드 거리 → 정규화 거리 (0~1, frame 대각선 기준) 반환.
-    추적 실패 or MAX_DRIFT 초과 → YOLO 재초기화.
+    ORB fallback 추가하여 특징점이 적은 애니메이션/3D 대응 강화.
     """
 
-    PATCH_SIZE     = 48    # 앵커당 GoodFeaturesToTrack 패치 크기
-    MIN_VALID_PTS  = 3     # 앵커당 최소 추적점 수
-    MAX_Y_JUMP     = 0.20  # 앵커당 프레임간 최대 y 이동 (정규화)
-    MAX_DRIFT      = 0.30  # 앵커당 초기화 이후 누적 최대 이동 (정규화 대각선)
-    REINIT_FRAMES  = 45    # YOLO로 앵커 재확인 주기 (프레임)
+    PATCH_SIZE     = 48
+    MIN_VALID_PTS  = 3
+    MAX_Y_JUMP     = 0.20
+    MAX_DRIFT      = 0.30
+    REINIT_FRAMES  = 45
 
     LK_PARAMS = dict(
         winSize=(19, 19),
@@ -506,26 +630,26 @@ class DualAnchorTracker:
 
     def __init__(self):
         self._prev_gray    = None
-        self._pts1         = None   # P1 앵커 추적점 (N,1,2)
-        self._pts2         = None   # P2 앵커 추적점 (N,1,2)
-        self._anchor1      = None   # P1 현재 중심 (x, y) 픽셀
-        self._anchor2      = None   # P2 현재 중심 (x, y) 픽셀
-        self._anchor1_init = None   # P1 초기화 시 중심
-        self._anchor2_init = None   # P2 초기화 시 중심
+        self._pts1         = None
+        self._pts2         = None
+        self._anchor1      = None
+        self._anchor2      = None
+        self._anchor1_init = None
+        self._anchor2_init = None
         self._frame_count  = 0
         self._initialized  = False
+        self._is_manual    = False
         self._frame_diag   = 1.0
+        self._orb = cv2.ORB_create(nfeatures=100)
+        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    def reset(self, p1_hip_px, p2_hip_px, frame_gray, frame_h, frame_w):
-        """
-        앵커 초기화. p1_hip_px, p2_hip_px: (x, y) 픽셀 좌표.
-        """
+    def reset(self, p1_hip_px, p2_hip_px, frame_gray, frame_h, frame_w, is_manual=False):
+        self._is_manual = is_manual
         self._frame_diag = float(np.sqrt(frame_h**2 + frame_w**2))
         self._frame_count = 0
         self._initialized = False
         self._frame_h = frame_h
 
-        # 수동 P2 앵커 누락 시 P1 추적만이라도 되도록 fallback 처리
         pts1 = self._init_anchor(frame_gray, p1_hip_px, frame_h, frame_w) if p1_hip_px else None
         pts2 = self._init_anchor(frame_gray, p2_hip_px, frame_h, frame_w) if p2_hip_px else None
 
@@ -543,12 +667,13 @@ class DualAnchorTracker:
                 float(np.median(pts2[:, 0, 0])), float(np.median(pts2[:, 0, 1]))
             )
 
-    def update(self, frame_gray, yolo_result=None, frame_h=None, frame_w=None):
-        """
-        반환: 정규화 거리 (0~1) or None
-        """
+    def update(self, frame_gray, yolo_result=None, frame_h=None, frame_w=None, is_duplicate=False):
         if not self._initialized or self._prev_gray is None:
             return None
+
+        # 중복 프레임(애니메이션)일 경우 추적 스킵하고 이전 상태 유지
+        if is_duplicate:
+            return self._current_dist()
 
         self._frame_count += 1
 
@@ -556,8 +681,20 @@ class DualAnchorTracker:
         if (self._frame_count % self.REINIT_FRAMES == 0
                 and yolo_result is not None and frame_h and frame_w):
             p1_px, p2_px = self._extract_hip_px(yolo_result)
-            if p1_px and p2_px:
-                self.reset(p1_px, p2_px, frame_gray, frame_h, frame_w)
+            
+            # Manual 모드에서는 현재 추적점과 너무 멀면 무시 (인접 인물 오폭 방지용 Threshold)
+            if self._is_manual:
+                MAX_RECALIBRATE_DIST = 0.12 * self._frame_diag
+                if p1_px is not None and self._anchor1 is not None:
+                    d1 = np.sqrt((p1_px[0]-self._anchor1[0])**2 + (p1_px[1]-self._anchor1[1])**2)
+                    if d1 > MAX_RECALIBRATE_DIST: p1_px = None
+                if p2_px is not None and self._anchor2 is not None:
+                    d2 = np.sqrt((p2_px[0]-self._anchor2[0])**2 + (p2_px[1]-self._anchor2[1])**2)
+                    if d2 > MAX_RECALIBRATE_DIST: p2_px = None
+            
+            # 둘 다 유효하거나, 하나라도 유효하면 해당 지점들로 reset (None인 쪽은 기존 추적점 유지)
+            if p1_px or p2_px:
+                self.reset(p1_px or self._anchor1, p2_px or self._anchor2, frame_gray, frame_h, frame_w, is_manual=self._is_manual)
                 return self._current_dist()
 
         # LK 추적
@@ -597,6 +734,10 @@ class DualAnchorTracker:
     def get_anchor_pixels(self):
         """디버그 오버레이용 현재 앵커 픽셀 반환."""
         return self._anchor1, self._anchor2
+
+    def is_manual(self):
+        """현재 앵커가 수동으로 설정되었는지 반환."""
+        return self._is_manual
         
     def get_p1_y_norm(self):
         """YOLO fallback용 y좌표 정규화 반환"""
@@ -627,12 +768,32 @@ class DualAnchorTracker:
         next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
             prev_gray, cur_gray, pts, None, **self.LK_PARAMS
         )
-        if next_pts is None:
-            return None
-        good = status.ravel() == 1
-        if good.sum() < self.MIN_VALID_PTS:
-            return None
+        
+        good = status.ravel() == 1 if status is not None else np.array([])
+        if status is None or good.sum() < self.MIN_VALID_PTS:
+            # LK 실패 시 ORB Fallback
+            return self._track_pts_orb(prev_gray, cur_gray, pts)
+            
         return next_pts[good].reshape(-1, 1, 2)
+
+    def _track_pts_orb(self, prev_gray, cur_gray, pts):
+        """ORB 특징점 매칭을 이용한 백업 추적 (LK 실패 시)."""
+        kp1, des1 = self._orb.detectAndCompute(prev_gray, None)
+        kp2, des2 = self._orb.detectAndCompute(cur_gray, None)
+        if des1 is None or des2 is None: return None
+        
+        matches = self._matcher.match(des1, des2)
+        if len(matches) < 4: return None
+        
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if M is None: return None
+        
+        # 이전 포인트들에 변환 행렬 적용
+        next_pts = cv2.perspectiveTransform(pts, M)
+        return next_pts
 
     def _current_dist(self):
         if self._anchor1 is None or self._anchor2 is None:

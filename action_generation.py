@@ -34,9 +34,9 @@ class ActionPointGenerator:
                 vel_seg = velocity_signal[start:end] if velocity_signal is not None else None
                 active_actions = self._sample_active(seg, start, vel_seg)
                 
-                # P5: Rhythm Regularization
-                stroke_freq = self._detect_stroke_frequency(seg)
-                active_actions = self._regularize_rhythm(active_actions, stroke_freq)
+                # P5: Rhythm Regularization (Disabled for personal fidelity)
+                # stroke_freq = self._detect_stroke_frequency(seg)
+                # active_actions = self._regularize_rhythm(active_actions, stroke_freq)
                 
                 actions.extend(active_actions)
 
@@ -86,8 +86,8 @@ class ActionPointGenerator:
         min_dist = max(1, int(self.fps / min_dist_divisor))
 
         signal_range = float(np.max(seg) - np.min(seg))
-        p_scale = config.get("sampling", "prominence_scale", 0.08)
-        p_min = config.get("sampling", "min_prominence", 1.5)
+        p_scale = config.get("sampling", "prominence_scale", 0.02) # Ultra sensitive
+        p_min = config.get("sampling", "min_prominence", 0.3)      # Ultra sensitive
         p_max = config.get("sampling", "max_prominence", 10.0)
         prominence = max(p_min, min(p_max, signal_range * p_scale))
 
@@ -106,7 +106,7 @@ class ActionPointGenerator:
 
         period_frames = self.fps / max(stroke_freq, 0.5)
         divisor = 8 if stroke_freq > 3.0 else 4
-        smooth_window = max(5, int(period_frames / divisor))
+        smooth_window = max(3, int(period_frames / divisor)) # Increased sensitivity
         smooth_window = smooth_window | 1
         if smooth_window >= len(seg):
             smooth_window = max(3, (len(seg) - 1) | 1)
@@ -237,7 +237,7 @@ class ActionPointGenerator:
             'pos': int(np.clip(np.round(pos_value), 0, 100))
         }
 
-    def _enforce_min_spacing(self, actions, min_gap_ms=33):
+    def _enforce_min_spacing(self, actions, min_gap_ms=10): # Minimal gap
         if len(actions) < 2: return actions
         actions.sort(key=lambda x: x['at'])
         filtered = [actions[0]]
