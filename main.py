@@ -55,8 +55,9 @@ class Pass1Result:
     scene_boundaries   : list   # [(start, end), ...]
     per_scene_rois     : list   # [roi_fraction, ...]
     per_scene_anchors  : list   # [anchor_dict or None, ...]
-    per_scene_persons  : list   # [[person_dict, ...], ...]  씬별 탐지 인물
-    per_scene_previews : list   # [base64_jpeg_str, ...]  씬별 대표 프레임
+    per_scene_persons      : list   # [[person_dict, ...], ...]  씬별 탐지 인물
+    per_scene_previews     : list   # [base64_jpeg_str, ...]  씬별 대표 프레임
+    per_scene_best_frames : list   # [int, ...]  프리뷰에 사용된 실제 프레임 인덱스
     fps                : float
     total_frames       : int
     video_duration_ms  : int
@@ -68,7 +69,8 @@ class Pass1Result:
 @_dataclass
 class UserConfig:
     """유저 인터랙션 설정."""
-    scene_configs : list  # [SceneConfig, ...]
+    scene_configs   : list  # [SceneConfig, ...]
+    generate_report : bool = True  # 검증 리포트 자동 생성 여부
 
     @classmethod
     def auto_from_pass1(cls, r: 'Pass1Result') -> 'UserConfig':
@@ -932,8 +934,9 @@ def pass1_analyze(video_path: str, progress_callback=None):
 
     per_scene_rois     = []
     per_scene_anchors  = []
-    per_scene_persons  = []
-    per_scene_previews = []
+    per_scene_persons     = []
+    per_scene_previews    = []
+    per_scene_best_frames = []
     anchor_selector    = SceneAnchorSelector() if yolo_tracker is not None else None
     n_scenes           = max(len(scene_boundaries), 1)
 
@@ -962,7 +965,8 @@ def pass1_analyze(video_path: str, progress_callback=None):
         # (단일 중간 프레임만 사용하면 특정 프레임에서 인물이 가려질 수 있음)
         scene_len = max(scene_end - scene_start, 1)
         sample_offsets = [0.20, 0.35, 0.50, 0.65, 0.80]
-        best_frame, best_persons = None, []
+        best_frame, best_persons, best_fi = None, [], scene_start + int(scene_len * 0.5)
+        
         for t in sample_offsets:
             fi = scene_start + int(scene_len * t)
             f = _extract_scene_frame(video_path, fi)
@@ -971,18 +975,19 @@ def pass1_analyze(video_path: str, progress_callback=None):
 
             # 이 씬에서 처음으로 유효하게 추출된 프레임을 기본 fallback으로 저장
             if best_frame is None:
-                best_frame, best_persons = f, []
+                best_frame, best_persons, best_fi = f, [], fi
 
             ps = yolo_tracker.detect_persons_stateless(f) if yolo_tracker is not None else []
             # 더 많은 인원이 탐지되거나, 같은 수라면 총 신뢰도가 더 높은 프레임 채택
             if ps and (len(ps) > len(best_persons) or
                     (len(ps) == len(best_persons) and
                      sum(p['confidence'] for p in ps) > sum(p['confidence'] for p in best_persons))):
-                best_frame, best_persons = f, ps
+                best_frame, best_persons, best_fi = f, ps, fi
         frame_bgr = best_frame
         persons   = best_persons
         per_scene_persons.append(persons)
         per_scene_previews.append(_draw_scene_preview(frame_bgr, persons))
+        per_scene_best_frames.append(best_fi)
 
         if progress_callback:
             pct = 5 + int((i + 1) / n_scenes * 10)
@@ -995,8 +1000,9 @@ def pass1_analyze(video_path: str, progress_callback=None):
         scene_boundaries   = scene_boundaries,
         per_scene_rois     = per_scene_rois,
         per_scene_anchors  = per_scene_anchors,
-        per_scene_persons  = per_scene_persons,
-        per_scene_previews = per_scene_previews,
+        per_scene_persons      = per_scene_persons,
+        per_scene_previews     = per_scene_previews,
+        per_scene_best_frames = per_scene_best_frames,
         fps                = fps,
         total_frames       = total_frames,
         video_duration_ms  = video_duration_ms,
@@ -1044,6 +1050,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     per_scene_rois    = r.per_scene_rois
     per_scene_anchors = r.per_scene_anchors
     per_scene_persons = r.per_scene_persons
+    per_scene_best_frames = getattr(r, 'per_scene_best_frames', [])
     yolo_tracker      = r.yolo_tracker
     flow_estimator    = r.flow_estimator
     fps               = r.fps
@@ -1094,6 +1101,9 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     yolo_hip_ys    = []
     yolo_ref_lens  = []
     yolo_confs     = []
+    yolo_p2_hip_ys   = []
+    yolo_p2_ref_lens = []
+    yolo_p2_confs    = []
     yolo_rel_dists = []
     yolo_is_duals  = []
     quality_records = []
@@ -1101,9 +1111,15 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     scene_types    = []
     head_hip_dists = []
     anchor_dists   = []
+    anchor_ncc_scores = []
     contact_tracker    = ContactPointTracker()
     anchor_tracker     = DualAnchorTracker()
     anchor_initialized = False
+
+    p1_snapshot_bgr = None
+    p2_snapshot_bgr = None
+    best_p1_conf = 0.0
+    best_p2_conf = 0.0
 
     _empty_yolo = {'hip_center_y': None, 'reference_length': None,
                    'confidence': 0.0, 'bbox': None, 'keypoints': None,
@@ -1111,18 +1127,11 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                    'secondary_keypoints': None,
                    'rel_dist': None, 'is_dual': False}
 
-    # ── F1: 첫 번째 씬(Frame 0)에 대한 추적기 초기화 및 힌트 적용 ──
+    # ── F1: 첫 번째 씬(Frame 0)에 대한 추적기 초기화 (힌트는 루프 중간에 적용) ──
     if yolo_tracker is not None:
         yolo_tracker.reset_tracking()
-        si = _get_scene_index(0, scene_boundaries)
-        if si < len(cfg.scene_configs) and si < len(per_scene_persons):
-            sc = cfg.scene_configs[si]
-            persons = per_scene_persons[si]
-            p1_bbox = persons[sc.p1_person_idx]['bbox'] if sc.p1_person_idx < len(persons) else None
-            p2_bbox = (persons[sc.p2_person_idx]['bbox']
-                       if sc.p2_person_idx >= 0 and sc.p2_person_idx < len(persons) else None)
-            if p1_bbox is not None:
-                yolo_tracker.set_slot_hint(p1_bbox, p2_bbox)
+    
+    scene_start_idx = 0 # 현재 씬의 시작 프레임 인덱스 (기록 스왑용)
 
     for i in range(total_frames - 1):
         ret, frame = cap.read()
@@ -1142,6 +1151,9 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             yolo_hip_ys.append(None)
             yolo_ref_lens.append(None)
             yolo_confs.append(0.0)
+            yolo_p2_hip_ys.append(None)
+            yolo_p2_ref_lens.append(None)
+            yolo_p2_confs.append(0.0)
             yolo_rel_dists.append(None)
             yolo_is_duals.append(False)
             quality_records.append({'conf': 0.0, 'is_dual': False, 'near_boundary': False})
@@ -1149,6 +1161,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             scene_types.append('QUIET')
             head_hip_dists.append(None)
             anchor_dists.append(None)
+            anchor_ncc_scores.append(None)
             prev_frame = frame_resized
             continue
 
@@ -1157,16 +1170,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             roi_tracker.reset(new_scene_roi)
             if yolo_tracker is not None:
                 yolo_tracker.reset_tracking()
-                # ── F1: 인물 선택 힌트 적용 ──
-                si = _get_scene_index(i, scene_boundaries)
-                if si < len(cfg.scene_configs) and si < len(per_scene_persons):
-                    sc = cfg.scene_configs[si]
-                    persons = per_scene_persons[si]
-                    p1_bbox = persons[sc.p1_person_idx]['bbox'] if sc.p1_person_idx < len(persons) else None
-                    p2_bbox = (persons[sc.p2_person_idx]['bbox']
-                               if sc.p2_person_idx >= 0 and sc.p2_person_idx < len(persons) else None)
-                    if p1_bbox is not None:
-                        yolo_tracker.set_slot_hint(p1_bbox, p2_bbox)
+            scene_start_idx = i
             scene_type_detector.reset()
             contact_tracker.reset()
             anchor_initialized = False
@@ -1200,6 +1204,34 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         if yolo_tracker is not None:
             yolo_result = yolo_tracker.process_frame(frame_resized,
                                                       roi_fractions=current_roi)
+            
+            # ── F1: UI에서 인물을 지정했던 바로 그 프레임에서 슬롯 싱크로 (ID 고정) ──
+            si_hint = _get_scene_index(i, scene_boundaries)
+            if si_hint < len(per_scene_best_frames) and i == per_scene_best_frames[si_hint]:
+                sc = cfg.scene_configs[si_hint]
+                persons_hint = per_scene_persons[si_hint]
+                p1_h = persons_hint[sc.p1_person_idx]['bbox'] if sc.p1_person_idx < len(persons_hint) else None
+                p2_h = (persons_hint[sc.p2_person_idx]['bbox'] 
+                        if 0 <= sc.p2_person_idx < len(persons_hint) else None)
+                
+                swaps = yolo_tracker.force_slot_reorder_by_hint(p1_h, p2_h)
+                if swaps:
+                    if 1 in swaps and swaps[1] == 0:
+                        # P1과 P2의 데이터를 서로 교체
+                        for idx in range(scene_start_idx, len(yolo_hip_ys)):
+                            yolo_hip_ys[idx], yolo_p2_hip_ys[idx] = yolo_p2_hip_ys[idx], yolo_hip_ys[idx]
+                            yolo_confs[idx], yolo_p2_confs[idx] = yolo_p2_confs[idx], yolo_confs[idx]
+                            yolo_ref_lens[idx], yolo_p2_ref_lens[idx] = yolo_p2_ref_lens[idx], yolo_ref_lens[idx]
+                        
+                        # 현재 프레임의 결과물(yolo_result)도 즉시 스왑 반영
+                        yolo_result['hip_center_y'], yolo_result['secondary_hip_y'] = yolo_result.get('secondary_hip_y'), yolo_result.get('hip_center_y')
+                        yolo_result['confidence'], yolo_result['secondary_confidence'] = yolo_result.get('secondary_confidence', 0.0), yolo_result.get('confidence', 0.0)
+                        yolo_result['reference_length'], yolo_result['secondary_reference_length'] = yolo_result.get('secondary_reference_length'), yolo_result.get('reference_length')
+                        yolo_result['bbox'], yolo_result['secondary_bbox'] = yolo_result.get('secondary_bbox'), yolo_result.get('bbox')
+                        yolo_result['keypoints'], yolo_result['secondary_keypoints'] = yolo_result.get('secondary_keypoints'), yolo_result.get('keypoints')
+                    
+                    best_p1_conf = 0.0
+                    best_p2_conf = 0.0
 
         scene_type = scene_type_detector.update(
             p1_kp=yolo_result.get('keypoints'),
@@ -1211,6 +1243,9 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         yolo_hip_ys.append(yolo_result['hip_center_y'])
         yolo_ref_lens.append(yolo_result['reference_length'])
         yolo_confs.append(yolo_result['confidence'])
+        yolo_p2_hip_ys.append(yolo_result.get('secondary_hip_y'))
+        yolo_p2_ref_lens.append(yolo_result.get('secondary_reference_length'))
+        yolo_p2_confs.append(yolo_result.get('secondary_confidence', 0.0))
         yolo_rel_dists.append(yolo_result.get('rel_dist'))
         yolo_is_duals.append(yolo_result.get('is_dual', False))
         scene_types.append(scene_type)
@@ -1228,6 +1263,22 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             cpx, cpy = None, None
         contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w, is_duplicate=is_dup)
         contact_ys.append(contact_y)
+
+        # ── Snapshot Capturing ──
+        if yolo_result.get('confidence', 0.0) > best_p1_conf and yolo_result.get('bbox') is not None:
+            best_p1_conf = yolo_result['confidence']
+            bbox = yolo_result['bbox']
+            x1, y1, x2, y2 = max(0, int(bbox[0])), max(0, int(bbox[1])), min(frame_w, int(bbox[2])), min(frame_h, int(bbox[3]))
+            if x2 > x1 and y2 > y1:
+                p1_snapshot_bgr = frame_resized[y1:y2, x1:x2].copy()
+                
+        if yolo_result.get('is_dual') and yolo_result.get('secondary_bbox') is not None:
+            if best_p2_conf == 0.0 or yolo_result['confidence'] > best_p2_conf:
+                best_p2_conf = yolo_result['confidence']
+                bbox2 = yolo_result['secondary_bbox']
+                x1, y1, x2, y2 = max(0, int(bbox2[0])), max(0, int(bbox2[1])), min(frame_w, int(bbox2[2])), min(frame_h, int(bbox2[3]))
+                if x2 > x1 and y2 > y1:
+                    p2_snapshot_bgr = frame_resized[y1:y2, x1:x2].copy()
 
         if not anchor_initialized:
             si = _get_scene_index(i, scene_boundaries)
@@ -1251,11 +1302,15 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                     anchor_initialized = True
 
         anchor_dist = None
+        anchor_ncc = None
         if anchor_initialized:
             anchor_dist = anchor_tracker.update(frame_gray, yolo_result, frame_h, frame_w, is_duplicate=is_dup)
             if anchor_dist is None:
                 anchor_initialized = False
+            elif anchor_tracker.is_manual():
+                anchor_ncc = anchor_tracker.get_ncc_score()
         anchor_dists.append(anchor_dist)
+        anchor_ncc_scores.append(anchor_ncc)
 
         # ── F2 앵커 hip_y → YOLO 낮은 신뢰도 프레임 보완 ──────────────────────
         # F2 수동 hip 지정 씬에서 YOLO가 P1을 잃으면, LK 앵커로 추적한 P1 y좌표를
@@ -1272,6 +1327,8 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                     yolo_confs[-1]  = 0.55   # anchor 신뢰도 (중간값)
                     if yolo_ref_lens[-1] is None:
                         yolo_ref_lens[-1] = 0.40  # 전형적 body height / frame_h
+
+
 
         prev_frame = frame_resized
 
@@ -1429,6 +1486,15 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     if progress_callback:
         progress_callback(70, 100, "Analyzing scenes...")
 
+    anchor_reliability = 0.0
+    if len(anchor_dists) > 0:
+        valid_anchor_frames = sum(1 for d in anchor_dists if d is not None)
+        valid_yolo_frames_with_anchor = sum(1 for i, d in enumerate(anchor_dists) if d is not None and yolo_confs[i] >= 0.3)
+        anchor_reliability = valid_yolo_frames_with_anchor / max(valid_anchor_frames, 1)
+
+    valid_nccs = [s for s in anchor_ncc_scores if s is not None]
+    manual_anchor_ncc = float(np.mean(valid_nccs)) if valid_nccs else 0.0
+
     if len(velocity_signal) > 5:
         velocity_smoothed = savgol_filter(velocity_signal, 5, 1)
     else:
@@ -1504,6 +1570,36 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             "x_range": [round(float(roi[2]), 3), round(float(roi[3]), 3)]
         })
 
+    # --- Analytics & Diagnostics ---
+    yolo_p1_conf_avg = float(np.mean([c for c in yolo_confs if c is not None])) if yolo_confs else 0.0
+    tracking_loss_ratio = float(sum(1 for c in yolo_confs if c is None or c < 0.2)) / max(len(yolo_confs), 1)
+    
+    # New integrity metrics
+    dual_presence_ratio = float(sum(1 for d in yolo_is_duals if d)) / max(len(yolo_is_duals), 1)
+    
+    # Calculate anchor loss only for frames where an anchor was active
+    anchor_active_count = sum(1 for d in anchor_dists if d is not None)
+    total_frames_with_anchor_potential = len(anchor_dists) # Simplified for now, or could check f2_set per frame
+    anchor_reliability = anchor_active_count / max(total_frames_with_anchor_potential, 1)
+
+    anomaly_timestamps = []
+    if len(velocity_smoothed) > 2:
+        diffs = np.abs(np.diff(velocity_smoothed))
+        spike_threshold = np.percentile(diffs, 98) * 2.0 if len(diffs) > 10 else 100
+        for i, d in enumerate(diffs):
+            if d > spike_threshold and d > 1.5:
+                time_ms = int((i / fps) * 1000)
+                if not anomaly_timestamps or time_ms - anomaly_timestamps[-1] > 1000:
+                    anomaly_timestamps.append(time_ms)
+                    
+    def _encode_b64(img_bgr):
+        if img_bgr is None: return None
+        # Max resolution for snapshot is 150px height
+        h, w = img_bgr.shape[:2]
+        if h > 150: img_bgr = cv2.resize(img_bgr, (int(w * 150/h), 150))
+        ret, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return base64.b64encode(buf.tobytes()).decode('utf-8') if ret else None
+
     output_script = {
         "actions": actions,
         "inverted": False,
@@ -1532,6 +1628,16 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                 "active": active_count,
                 "transition": trans_count,
                 "quiet": quiet_count
+            },
+            "tracking_quality": {
+                "yolo_p1_confidence_avg": round(yolo_p1_conf_avg, 3),
+                "tracking_loss_ratio": round(tracking_loss_ratio, 3),
+                "dual_presence_ratio": round(dual_presence_ratio, 3),
+                "anchor_reliability": round(anchor_reliability, 3),
+                "manual_anchor_ncc": round(manual_anchor_ncc, 3),
+                "anomaly_timestamps": anomaly_timestamps,
+                "p1_snapshot_b64": _encode_b64(p1_snapshot_bgr),
+                "p2_snapshot_b64": _encode_b64(p2_snapshot_bgr)
             }
         },
         "range": 100
@@ -1545,6 +1651,14 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
 
     print(f"\nGenerated {len(actions)} actions")
     print(f"Saved to: {output_path}")
+
+    if cfg.generate_report:
+        try:
+            import evaluator
+            evaluator.evaluate_single(output_path)
+            print(f"Analysis report generated for {os.path.basename(output_path)}")
+        except Exception as eval_e:
+            print(f"Report generation failed: {eval_e}")
 
     return True
 

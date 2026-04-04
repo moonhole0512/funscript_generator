@@ -891,8 +891,14 @@ async def main(page: ft.Page):
         ], spacing=8)
 
         # ══════════════════════════════════════════════════════════════════
-        # Assemble dialog with 3 tabs
+        # Assemble dialog with 3 tabs + Global Options
         # ══════════════════════════════════════════════════════════════════
+        report_switch = ft.Switch(
+            label="Generate Analysis Report (HTML/JSON)",
+            value=cfg.generate_report,
+            active_color=ft.Colors.CYAN_ACCENT,
+            scale=0.9
+        )
         _started = [False]
 
         def on_start(e):
@@ -902,6 +908,7 @@ async def main(page: ft.Page):
             # Flush F3 toggle state into cfg
             for sw, sc2 in zip(toggles, cfg.scene_configs):
                 sc2.enabled = sw.value
+            cfg.generate_report = report_switch.value
             item.user_config = cfg
             dialog.open = False
             page.update()
@@ -933,13 +940,18 @@ async def main(page: ft.Page):
                           size=14, weight=ft.FontWeight.W_600),
             content=ft.Container(content=tabs, width=520, height=510),
             actions=[
-                ft.Button(
-                    "Start Processing",
-                    icon=ft.Icons.PLAY_ARROW,
-                    on_click=on_start,
-                    bgcolor=ft.Colors.CYAN_700,
-                    color=ft.Colors.WHITE,
-                ),
+                ft.Row([
+                    report_switch,
+                    ft.Container(expand=True),
+                    ft.Button(
+                        "Start Processing",
+                        icon=ft.Icons.PLAY_ARROW,
+                        on_click=on_start,
+                        bgcolor=ft.Colors.CYAN_700,
+                        color=ft.Colors.WHITE,
+                    ),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, spacing=10, 
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER)
             ],
             actions_alignment=ft.MainAxisAlignment.END,
             on_dismiss=on_start,

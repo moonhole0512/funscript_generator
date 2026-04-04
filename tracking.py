@@ -181,12 +181,23 @@ class ROIDetector:
             if frame is None: continue
             if hw is None: hw = frame.shape[:2]
             res = yolo_tracker.detect_persons_stateless(frame)
-            if res and res[0]['bbox'] is not None and res[0]['confidence'] >= min_conf: 
-                bboxes.append(res[0]['bbox'])
+            
+            frame_bboxes = []
+            for p in res:
+                if p['bbox'] is not None and p['confidence'] >= min_conf:
+                    frame_bboxes.append(p['bbox'])
+            
+            if frame_bboxes:
+                ba_f = np.array(frame_bboxes, dtype=np.float32)
+                bboxes.append((np.min(ba_f[:, 0]), np.min(ba_f[:, 1]), np.max(ba_f[:, 2]), np.max(ba_f[:, 3])))
+                
         cap.release()
         if hw is None or len(bboxes) < max(3, int(len(indices) * min_hit_ratio)): return None
+        
         ba = np.array(bboxes, dtype=np.float32)
-        x1m, y1m, x2m, y2m = np.median(ba[:, 0]), np.median(ba[:, 1]), np.median(ba[:, 2]), np.median(ba[:, 3])
+        # Use percentiles to ensure robustness against frames where some persons were missing
+        x1m, y1m = np.percentile(ba[:, 0], 25), np.percentile(ba[:, 1], 25)
+        x2m, y2m = np.percentile(ba[:, 2], 75), np.percentile(ba[:, 3], 75)
         fh, fw = hw
         bw, bh = x2m - x1m, y2m - y1m
         margin = 0.12
@@ -250,7 +261,7 @@ class YoloPoseTracker:
     LEFT_HIP, RIGHT_HIP, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_KNEE, RIGHT_KNEE = 11, 12, 5, 6, 13, 14
     KP_BODY_WEIGHTS = {11: 2.0, 12: 2.0, 13: 0.6, 14: 0.6}
     HIP_KNEE_RATIO, MIN_KP_CONF, MIN_DET_CONF = 0.12, 0.30, 0.40
-    MAX_SLOTS, SLOT_MATCH_DIST, HIP_HISTORY_LEN, MAX_MISS_FRAMES = 2, 0.25, 40, 20
+    MAX_SLOTS, SLOT_MATCH_DIST, HIP_HISTORY_LEN, MAX_MISS_FRAMES = 5, 0.25, 40, 20
     DUAL_WARMUP_FRAMES, DUAL_STABLE_FRAMES, IOU_DUPLICATE_THRESH, EMA_HIP_ALPHA = 30, 15, 0.60, 0.4
     MIN_ROI_OVERLAP, P2_PROXIMITY_MAR, MIN_P2_SIZE_RATIO = 0.05, 0.60, 0.35
 
@@ -420,19 +431,6 @@ class YoloPoseTracker:
             else:
                 s['pred_bbox'] = s['bbox']
 
-        matches = []
-        for si, s in enumerate(self._slots):
-            if si in matched_slots or s['miss'] > self.MAX_MISS_FRAMES: continue
-            for pi in unmatched_ps:
-                iou = self._iou(s['pred_bbox'], persons[pi]['bbox'])
-                if iou > 0.25: matches.append((iou, si, pi))
-        
-        matches.sort(key=lambda x: x[0], reverse=True)
-        for iou, si, pi in matches:
-            if si not in matched_slots and pi in unmatched_ps:
-                matched_slots.add(si); unmatched_ps.remove(pi)
-                self._assign_person_to_slot(self._slots[si], persons[pi])
-
         track_matches = []
         for pi in unmatched_ps:
             tid = persons[pi].get('track_id')
@@ -442,6 +440,19 @@ class YoloPoseTracker:
                     track_matches.append((si, pi))
                     
         for si, pi in track_matches:
+            if si not in matched_slots and pi in unmatched_ps:
+                matched_slots.add(si); unmatched_ps.remove(pi)
+                self._assign_person_to_slot(self._slots[si], persons[pi])
+
+        matches = []
+        for si, s in enumerate(self._slots):
+            if si in matched_slots or s['miss'] > self.MAX_MISS_FRAMES: continue
+            for pi in unmatched_ps:
+                iou = self._iou(s['pred_bbox'], persons[pi]['bbox'])
+                if iou > 0.25: matches.append((iou, si, pi))
+        
+        matches.sort(key=lambda x: x[0], reverse=True)
+        for iou, si, pi in matches:
             if si not in matched_slots and pi in unmatched_ps:
                 matched_slots.add(si); unmatched_ps.remove(pi)
                 self._assign_person_to_slot(self._slots[si], persons[pi])
@@ -490,7 +501,15 @@ class YoloPoseTracker:
         res = {'hip_center_y': p1['hip_center_y'], 'reference_length': p1['reference_length'], 'confidence': p1['confidence'], 'bbox': p1['bbox'], 'keypoints': p1['keypoints'], 'secondary_hip_y': None, 'secondary_bbox': None, 'secondary_keypoints': None, 'rel_dist': None, 'is_dual': False}
         if len(self._slots) >= 2 and self._slots[1]['last_result']:
             p2 = self._slots[1]['last_result']
-            res.update({'secondary_hip_y': p2['hip_center_y'], 'secondary_bbox': p2['bbox'], 'secondary_keypoints': p2.get('keypoints'), 'rel_dist': abs(p1['hip_center_y'] - p2['hip_center_y']) if p1['hip_center_y'] is not None and p2['hip_center_y'] is not None else None, 'is_dual': True})
+            res.update({
+                'secondary_hip_y': p2['hip_center_y'], 
+                'secondary_bbox': p2['bbox'], 
+                'secondary_keypoints': p2.get('keypoints'),
+                'secondary_confidence': p2.get('confidence', 0.0),
+                'secondary_reference_length': p2.get('reference_length'),
+                'rel_dist': abs(p1['hip_center_y'] - p2['hip_center_y']) if p1['hip_center_y'] is not None and p2['hip_center_y'] is not None else None, 
+                'is_dual': True
+            })
         return res
 
     def detect_persons_stateless(self, frame_bgr):
@@ -515,13 +534,64 @@ class YoloPoseTracker:
         self._dual_confirmed = False; self._frame_count = 0
         self._hint_applied = False
 
-    def set_slot_hint(self, p1_bbox, p2_bbox=None):
-        """Set hint bboxes for primary/secondary slots to stabilize tracking at scene start."""
-        self._p1_hint_bbox = p1_bbox
-        self._p2_hint_bbox = p2_bbox
-        self._hint_applied = False
-        self._slots.clear()
+    def force_slot_reorder_by_hint(self, p1_hint_bbox, p2_hint_bbox=None):
+        """Reorder existing slots so that the ones matching hints are at index 0 and 1."""
+        if not self._slots:
+            return None
+
+        def _find_best_slot(hint_bbox):
+            if hint_bbox is None: return -1
+            best_iou, best_si = 0.0, -1
+            for si, s in enumerate(self._slots):
+                if s['bbox'] is None: continue
+                iou = self._iou(hint_bbox, s['bbox'])
+                if iou > best_iou: best_iou, best_si = iou, si
+            return best_si if best_iou > 0.1 else -1
+
+        si1 = _find_best_slot(p1_hint_bbox)
+        si2 = _find_best_slot(p2_hint_bbox)
+        
+        # Identity Map: original_index -> new_intended_index
+        swaps = {}
+        if si1 != -1:
+            swaps[si1] = 0
+            if si2 != -1 and si2 != si1:
+                swaps[si2] = 1
+        elif si2 != -1:
+            swaps[si2] = 1
+
+        if not swaps:
+            return None
+
+        # Reconstruct slots list
+        new_slots = [None] * len(self._slots)
+        used_orig = set()
+        
+        # Place the matched ones
+        for orig_si, new_si in swaps.items():
+            new_slots[new_si] = self._slots[orig_si]
+            used_orig.add(orig_si)
+            
+        # Fill the rest
+        next_free = 0
+        for orig_si in range(len(self._slots)):
+            if orig_si in used_orig: continue
+            while next_free < len(new_slots) and new_slots[next_free] is not None:
+                next_free += 1
+            if next_free < len(new_slots):
+                new_slots[next_free] = self._slots[orig_si]
+                next_free += 1
+        
+        # Clean up None (if any, though shouldn't happen)
+        self._slots = [s for s in new_slots if s is not None]
+        
+        # Rebuild track_id_map
         self._track_id_map.clear()
+        for i, s in enumerate(self._slots):
+            if s['last_result'] and s['last_result'].get('track_id') is not None:
+                self._track_id_map[s['last_result']['track_id']] = i
+                
+        return swaps # Return map for retrospective data swapping in main.py
 
     def get_psp(self):
         """Returns the Personalized Skeleton Profile (PSP) for P1 and P2."""
@@ -642,6 +712,9 @@ class DualAnchorTracker:
         self._frame_diag   = 1.0
         self._orb = cv2.ORB_create(nfeatures=100)
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self._patch1       = None
+        self._patch2       = None
+        self._last_ncc     = 0.0
 
     def reset(self, p1_hip_px, p2_hip_px, frame_gray, frame_h, frame_w, is_manual=False):
         self._is_manual = is_manual
@@ -650,22 +723,26 @@ class DualAnchorTracker:
         self._initialized = False
         self._frame_h = frame_h
 
-        pts1 = self._init_anchor(frame_gray, p1_hip_px, frame_h, frame_w) if p1_hip_px else None
-        pts2 = self._init_anchor(frame_gray, p2_hip_px, frame_h, frame_w) if p2_hip_px else None
+        ret1 = self._init_anchor(frame_gray, p1_hip_px, frame_h, frame_w) if p1_hip_px else None
+        ret2 = self._init_anchor(frame_gray, p2_hip_px, frame_h, frame_w) if p2_hip_px else None
 
-        if pts1 is not None:
-            self._pts1 = pts1
+        if ret1 is not None:
+            self._pts1, self._patch1 = ret1
             self._anchor1 = self._anchor1_init = (
-                float(np.median(pts1[:, 0, 0])), float(np.median(pts1[:, 0, 1]))
+                float(np.median(self._pts1[:, 0, 0])), float(np.median(self._pts1[:, 0, 1]))
             )
             self._prev_gray = frame_gray
             self._initialized = True
             
-        if pts2 is not None:
-            self._pts2 = pts2
+        if ret2 is not None:
+            self._pts2, self._patch2 = ret2
             self._anchor2 = self._anchor2_init = (
-                float(np.median(pts2[:, 0, 0])), float(np.median(pts2[:, 0, 1]))
+                float(np.median(self._pts2[:, 0, 0])), float(np.median(self._pts2[:, 0, 1]))
             )
+
+    def get_ncc_score(self):
+        """Returns the latest Normalized Cross-Correlation metadata for manual tracking stability."""
+        return self._last_ncc
 
     def update(self, frame_gray, yolo_result=None, frame_h=None, frame_w=None, is_duplicate=False):
         if not self._initialized or self._prev_gray is None:
@@ -677,20 +754,10 @@ class DualAnchorTracker:
 
         self._frame_count += 1
 
-        # REINIT_FRAMES 마다 YOLO로 앵커 재확인
-        if (self._frame_count % self.REINIT_FRAMES == 0
+        # REINIT_FRAMES 마다 YOLO로 앵커 재확인 (단, Manual 모드에서는 LK와 템플릿만 믿고 YOLO 의존 제거)
+        if (not self._is_manual and self._frame_count % self.REINIT_FRAMES == 0
                 and yolo_result is not None and frame_h and frame_w):
             p1_px, p2_px = self._extract_hip_px(yolo_result)
-            
-            # Manual 모드에서는 현재 추적점과 너무 멀면 무시 (인접 인물 오폭 방지용 Threshold)
-            if self._is_manual:
-                MAX_RECALIBRATE_DIST = 0.12 * self._frame_diag
-                if p1_px is not None and self._anchor1 is not None:
-                    d1 = np.sqrt((p1_px[0]-self._anchor1[0])**2 + (p1_px[1]-self._anchor1[1])**2)
-                    if d1 > MAX_RECALIBRATE_DIST: p1_px = None
-                if p2_px is not None and self._anchor2 is not None:
-                    d2 = np.sqrt((p2_px[0]-self._anchor2[0])**2 + (p2_px[1]-self._anchor2[1])**2)
-                    if d2 > MAX_RECALIBRATE_DIST: p2_px = None
             
             # 둘 다 유효하거나, 하나라도 유효하면 해당 지점들로 reset (None인 쪽은 기존 추적점 유지)
             if p1_px or p2_px:
@@ -728,6 +795,7 @@ class DualAnchorTracker:
         self._anchor1 = a1
         self._anchor2 = a2
         self._prev_gray = frame_gray
+        self._last_ncc = self._calculate_ncc(frame_gray, a1, self._patch1) if self._is_manual and a1 and self._patch1 is not None else 1.0
 
         return self._current_dist()
 
@@ -760,7 +828,18 @@ class DualAnchorTracker:
             return None
         pts[:, 0, 0] += x1
         pts[:, 0, 1] += y1
-        return pts
+        return pts, patch.copy()
+
+    def _calculate_ncc(self, frame_gray, px, patch):
+        if patch.size == 0 or len(patch.shape) != 2: return 0.0
+        h, w = patch.shape
+        cx, cy = int(px[0]), int(px[1])
+        x1, y1 = max(0, cx - w//2), max(0, cy - h//2)
+        x2, y2 = min(frame_gray.shape[1], x1 + w), min(frame_gray.shape[0], y1 + h)
+        cur_patch = frame_gray[y1:y2, x1:x2]
+        if cur_patch.shape != patch.shape: return 0.0
+        res = cv2.matchTemplate(cur_patch, patch, cv2.TM_CCOEFF_NORMED)
+        return float(np.max(res))
 
     def _track_pts(self, prev_gray, cur_gray, pts):
         if pts is None or len(pts) < self.MIN_VALID_PTS:
