@@ -10,7 +10,7 @@ class ActionPointGenerator:
     def __init__(self, fps):
         self.fps = fps
 
-    def generate(self, position_signal, segments, velocity_signal=None):
+    def generate(self, position_signal, segments, velocity_signal=None, impact_bounce_intensity=0.0, auto_floor_align=False):
         """Generate funscript action points using peak/trough-primary strategy."""
         if len(position_signal) < 2:
             return []
@@ -32,7 +32,7 @@ class ActionPointGenerator:
                 actions.extend(trans_actions)
             else:  # ACTIVE
                 vel_seg = velocity_signal[start:end] if velocity_signal is not None else None
-                active_actions = self._sample_active(seg, start, vel_seg)
+                active_actions = self._sample_active(seg, start, vel_seg, impact_bounce_intensity, auto_floor_align)
                 
                 # P5: Rhythm Regularization (Disabled for personal fidelity)
                 # stroke_freq = self._detect_stroke_frequency(seg)
@@ -73,7 +73,7 @@ class ActionPointGenerator:
 
         return float(max(fft_freq, zc_freq))
 
-    def _sample_active(self, seg, global_offset, vel_seg=None):
+    def _sample_active(self, seg, global_offset, vel_seg=None, impact_bounce_intensity=0.0, auto_floor_align=False):
         if len(seg) < 3:
             return [self._make_action(global_offset, seg[0])]
 
@@ -81,6 +81,9 @@ class ActionPointGenerator:
         pos_mean = float(np.mean(seg))
         if pos_range < 8 and 38 < pos_mean < 62:
             return []
+
+        # Floor Alignment logic moved to peak/trough detection phase below.
+        pass
 
         min_dist_divisor = config.get("sampling", "min_dist_divisor", 20)
         min_dist = max(1, int(self.fps / min_dist_divisor))
@@ -119,6 +122,13 @@ class ActionPointGenerator:
         peaks, _ = find_peaks(seg_smooth, distance=min_dist, prominence=prominence)
         troughs, _ = find_peaks(-seg_smooth, distance=min_dist, prominence=prominence)
 
+        # Local Floor Snapping: Ensure individual troughs reach 0 if they are close enough.
+        if auto_floor_align:
+            _FLOOR_SNAP_THRESHOLD = 30.0
+            for t_idx in troughs:
+                if seg[t_idx] <= _FLOOR_SNAP_THRESHOLD:
+                    seg[t_idx] = 0.0
+
         all_extrema = sorted(set(peaks) | set(troughs))
         stroke_period_ms = 1000.0 / max(stroke_freq, 0.3)
         freq_based_gap = max(30, min(1000, int(stroke_period_ms * 1.2)))
@@ -137,23 +147,6 @@ class ActionPointGenerator:
         for idx in peaks: primary_indices.add(idx)
         for idx in troughs: primary_indices.add(idx)
 
-        # Bounce/Rebound detection
-        _BOUNCE_TROUGH_MAX = 12
-        _BOUNCE_MIN_AMP    = 25
-        _bounce_look       = max(2, int(self.fps * 0.20))
-        bounce_extra = []
-        for t_idx in troughs:
-            if seg[t_idx] > _BOUNCE_TROUGH_MAX: continue
-            look = min(t_idx, _bounce_look)
-            if look < 2: continue
-            preceding_max = float(np.max(seg[max(0, t_idx - look):t_idx + 1]))
-            if preceding_max - seg[t_idx] < _BOUNCE_MIN_AMP: continue
-            trough_pos = float(seg[t_idx])
-            for offset, delta in [(1, 2.5), (2, 0.5)]:
-                b_idx = t_idx + offset
-                if 0 < b_idx < len(seg) - 1:
-                    bounce_extra.append(self._make_action(global_offset + b_idx, trough_pos + delta))
-
         refined_indices = set()
         for idx in primary_indices:
             search_start = max(0, idx - 3)
@@ -169,6 +162,51 @@ class ActionPointGenerator:
             refined_indices.add(best)
 
         sorted_indices = sorted(refined_indices)
+
+        # Bounce/Rebound detection (Action-Reaction physics)
+        bounce_extra = []
+        if impact_bounce_intensity > 0:
+            _BOUNCE_TROUGH_MAX = 25      # 인계 하한값을 15에서 25로 완화 (0에 딱 붙지 않아도 발동)
+            _BOUNCE_MIN_AMP    = 25      # 타격 진폭 요구치를 35에서 25로 완화 (약한 타격도 바운스 허용)
+            _bounce_gap_ms     = 85      # Standard bounce interval
+            _bounce_frames     = max(2, int(self.fps * _bounce_gap_ms / 1000.0))
+            
+            for t_idx in troughs:
+                if seg[t_idx] > _BOUNCE_TROUGH_MAX: continue
+                
+                # Check falling amplitude
+                look_back = max(3, int(self.fps * 0.25)) # 250ms
+                if t_idx < look_back: continue
+                pre_max = float(np.max(seg[t_idx - look_back : t_idx]))
+                amplitude = pre_max - seg[t_idx]
+                
+                if amplitude < _BOUNCE_MIN_AMP: continue
+                
+                # Calculate rebound height based on intensity slider (0-100)
+                # intensity 100 -> ~25% of amplitude rebound
+                rebound_height = (amplitude * 0.25) * (impact_bounce_intensity / 100.0)
+                
+                if rebound_height < 5.0: continue # Too small to feel
+                
+                # Insert 0 -> 20 -> 0 style triplet if there's space
+                # 1. Peek at next main action
+                next_main_idx = len(seg) - 1
+                for idx in sorted_indices:
+                    if idx > t_idx:
+                        next_main_idx = idx
+                        break
+                
+                available_gap = next_main_idx - t_idx
+                if available_gap > _bounce_frames * 2.5:
+                    # Point 1: Rebound Peak
+                    b1_idx = t_idx + _bounce_frames
+                    b1_pos = float(seg[t_idx] + rebound_height)
+                    bounce_extra.append(self._make_action(global_offset + b1_idx, b1_pos))
+                    
+                    # Point 2: Settle Back
+                    b2_idx = t_idx + _bounce_frames * 2
+                    b2_pos = float(seg[t_idx])
+                    bounce_extra.append(self._make_action(global_offset + b2_idx, b2_pos))
         actions = [self._make_action(global_offset + idx, seg[idx]) for idx in sorted_indices]
         actions = self._fill_gaps(actions, seg, global_offset, max_gap_ms)
 

@@ -890,6 +890,38 @@ async def main(page: ft.Page):
             f2_coords,
         ], spacing=8)
 
+        # ── F4: Physics / Post-processing Options ───────────────────────────
+        bounce_slider = ft.Slider(
+            min=0, max=100, divisions=20,
+            value=cfg.impact_bounce_intensity,
+            label="{value}%",
+            active_color=ft.Colors.CYAN_ACCENT,
+        )
+        auto_floor_switch = ft.Switch(
+            label="Auto Floor Alignment",
+            value=cfg.auto_floor_align,
+            active_color=ft.Colors.CYAN_ACCENT,
+            scale=0.9
+        )
+        physics_content = ft.Column([
+            ft.Text("Physics & Post-processing", size=14, weight=ft.FontWeight.BOLD),
+            ft.Text("Impact Rebound Intensity (Bottom Bounce)", size=12, color=ft.Colors.GREY_400),
+            ft.Row([
+                ft.Icon(ft.Icons.VIBRATION, size=20, color=ft.Colors.CYAN_400),
+                bounce_slider,
+                ft.Text("Strong", size=11, color=ft.Colors.GREY_500),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Text("Adds '0 > 20 > 0' style rebound pulses when hitting the bottom. "
+                    "Higher value increases the secondary bounce height.", 
+                    size=11, color=ft.Colors.GREY_500, italic=True),
+            ft.Divider(height=10, color=ft.Colors.with_opacity(0.1, ft.Colors.WHITE)),
+            ft.Text("Signal Correction", size=12, color=ft.Colors.GREY_400),
+            auto_floor_switch,
+            ft.Text("Automatically shifts the floor to 0 if the strokes are shallow. "
+                    "Ensures bounces are triggered properly.",
+                    size=11, color=ft.Colors.GREY_500, italic=True),
+        ], spacing=15)
+
         # ══════════════════════════════════════════════════════════════════
         # Assemble dialog with 3 tabs + Global Options
         # ══════════════════════════════════════════════════════════════════
@@ -905,10 +937,12 @@ async def main(page: ft.Page):
             if _started[0]:
                 return
             _started[0] = True
-            # Flush F3 toggle state into cfg
+            # Flush settings into cfg
             for sw, sc2 in zip(toggles, cfg.scene_configs):
                 sc2.enabled = sw.value
             cfg.generate_report = report_switch.value
+            cfg.impact_bounce_intensity = bounce_slider.value
+            cfg.auto_floor_align = auto_floor_switch.value
             item.user_config = cfg
             dialog.open = False
             page.update()
@@ -922,14 +956,16 @@ async def main(page: ft.Page):
                     ft.Tab(label="Scenes"),
                     ft.Tab(label="Persons"),
                     ft.Tab(label="Manual Hip"),
+                    ft.Tab(label="Physics"),
                 ]),
                 ft.TabBarView(controls=[
                     ft.Container(content=f3_content, padding=_tab_pad),
                     ft.Container(content=f1_content, padding=_tab_pad),
                     ft.Container(content=f2_content, padding=_tab_pad),
+                    ft.Container(content=physics_content, padding=_tab_pad),
                 ], expand=True),
             ]),
-            length=3,
+            length=4,
             selected_index=0,
             expand=True,
         )

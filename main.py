@@ -69,8 +69,10 @@ class Pass1Result:
 @_dataclass
 class UserConfig:
     """유저 인터랙션 설정."""
-    scene_configs   : list  # [SceneConfig, ...]
-    generate_report : bool = True  # 검증 리포트 자동 생성 여부
+    scene_configs           : list  # [SceneConfig, ...]
+    generate_report         : bool  = True  # 검증 리포트 자동 생성 여부
+    impact_bounce_intensity : float = 25.0  # 타격 반반력 강도 (0~100)
+    auto_floor_align        : bool  = True  # 바닥 기준점 자동 보정 여부
 
     @classmethod
     def auto_from_pass1(cls, r: 'Pass1Result') -> 'UserConfig':
@@ -1536,7 +1538,12 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         progress_callback(85, 100, "Generating action points...")
 
     action_generator = ActionPointGenerator(fps)
-    actions = action_generator.generate(position_normalized, segments, velocity_signal=velocity_smoothed)
+    actions = action_generator.generate(
+        position_normalized, segments, 
+        velocity_signal=velocity_smoothed,
+        impact_bounce_intensity=cfg.impact_bounce_intensity,
+        auto_floor_align=cfg.auto_floor_align
+    )
 
     if frame_callback:
         graph_b64 = _draw_result_graph(
@@ -2133,7 +2140,13 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
         progress_callback(85, 100, "Generating action points...")
 
     action_generator = ActionPointGenerator(fps)
-    actions = action_generator.generate(position_normalized, segments, velocity_signal=velocity_smoothed)
+    # Note: Using default True if cfg not available in legacy
+    actions = action_generator.generate(
+        position_normalized, segments, 
+        velocity_signal=velocity_smoothed,
+        impact_bounce_intensity=cfg.impact_bounce_intensity if 'cfg' in locals() else 25.0,
+        auto_floor_align=cfg.auto_floor_align if 'cfg' in locals() else True
+    )
 
     # ── Result graph (before post-processing — position signal + raw action points) ──
     if frame_callback:
