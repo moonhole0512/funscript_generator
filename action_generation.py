@@ -16,6 +16,12 @@ class ActionPointGenerator:
             return []
 
         actions = []
+        self.stats = {
+            'bounce_count': 0, 
+            'floor_snap_count': 0,
+            'bounce_skipped_fast': 0,
+            'bounce_skipped_weak': 0
+        }
 
         for start, end, seg_type in segments:
             end = min(end, len(position_signal))
@@ -50,7 +56,7 @@ class ActionPointGenerator:
         snap_thresh = config.get("normalization", "snap_threshold", 3)
         actions = self._snap_extremes(actions, snap_threshold=snap_thresh)
 
-        return actions
+        return actions, self.stats
 
     def _detect_stroke_frequency(self, seg):
         if len(seg) < int(self.fps):
@@ -128,6 +134,7 @@ class ActionPointGenerator:
             for t_idx in troughs:
                 if seg[t_idx] <= _FLOOR_SNAP_THRESHOLD:
                     seg[t_idx] = 0.0
+                    self.stats['floor_snap_count'] += 1
 
         all_extrema = sorted(set(peaks) | set(troughs))
         stroke_period_ms = 1000.0 / max(stroke_freq, 0.3)
@@ -183,10 +190,12 @@ class ActionPointGenerator:
                 if amplitude < _BOUNCE_MIN_AMP: continue
                 
                 # Calculate rebound height based on intensity slider (0-100)
-                # intensity 100 -> ~25% of amplitude rebound
-                rebound_height = (amplitude * 0.25) * (impact_bounce_intensity / 100.0)
+                # intensity 20 -> Rebound to 20 height (as long as amplitude permits)
+                rebound_height = min(float(impact_bounce_intensity), amplitude * 0.5)
                 
-                if rebound_height < 5.0: continue # Too small to feel
+                if rebound_height < 3.0: # Even smaller threshold to avoid loss
+                    self.stats['bounce_skipped_weak'] += 1
+                    continue 
                 
                 # Insert 0 -> 20 -> 0 style triplet if there's space
                 # 1. Peek at next main action
@@ -197,7 +206,7 @@ class ActionPointGenerator:
                         break
                 
                 available_gap = next_main_idx - t_idx
-                if available_gap > _bounce_frames * 2.5:
+                if available_gap >= _bounce_frames * 2.0: # Relaxed from 2.5 to 2.0
                     # Point 1: Rebound Peak
                     b1_idx = t_idx + _bounce_frames
                     b1_pos = float(seg[t_idx] + rebound_height)
@@ -207,6 +216,9 @@ class ActionPointGenerator:
                     b2_idx = t_idx + _bounce_frames * 2
                     b2_pos = float(seg[t_idx])
                     bounce_extra.append(self._make_action(global_offset + b2_idx, b2_pos))
+                    self.stats['bounce_count'] += 1
+                else:
+                    self.stats['bounce_skipped_fast'] += 1
         actions = [self._make_action(global_offset + idx, seg[idx]) for idx in sorted_indices]
         actions = self._fill_gaps(actions, seg, global_offset, max_gap_ms)
 

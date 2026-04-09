@@ -1118,10 +1118,10 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     anchor_tracker     = DualAnchorTracker()
     anchor_initialized = False
 
-    p1_snapshot_bgr = None
-    p2_snapshot_bgr = None
-    best_p1_conf = 0.0
-    best_p2_conf = 0.0
+    scene_p1_snapshots = {}  # si -> bgr
+    scene_p2_snapshots = {}  # si -> bgr
+    scene_best_p1_conf = {}  # si -> confidence
+    scene_best_p2_conf = {}  # si -> confidence
 
     _empty_yolo = {'hip_center_y': None, 'reference_length': None,
                    'confidence': 0.0, 'bbox': None, 'keypoints': None,
@@ -1266,21 +1266,23 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         contact_y = contact_tracker.update(frame_gray, cpx, cpy, frame_h, frame_w, is_duplicate=is_dup)
         contact_ys.append(contact_y)
 
-        # ── Snapshot Capturing ──
-        if yolo_result.get('confidence', 0.0) > best_p1_conf and yolo_result.get('bbox') is not None:
-            best_p1_conf = yolo_result['confidence']
+        # ── Snapshot Capturing (Per Scene) ──
+        si_snap = _get_scene_index(i, scene_boundaries)
+        if yolo_result.get('confidence', 0.0) > scene_best_p1_conf.get(si_snap, 0.0) and yolo_result.get('bbox') is not None:
+            scene_best_p1_conf[si_snap] = yolo_result['confidence']
             bbox = yolo_result['bbox']
             x1, y1, x2, y2 = max(0, int(bbox[0])), max(0, int(bbox[1])), min(frame_w, int(bbox[2])), min(frame_h, int(bbox[3]))
             if x2 > x1 and y2 > y1:
-                p1_snapshot_bgr = frame_resized[y1:y2, x1:x2].copy()
+                scene_p1_snapshots[si_snap] = frame_resized[y1:y2, x1:x2].copy()
                 
         if yolo_result.get('is_dual') and yolo_result.get('secondary_bbox') is not None:
-            if best_p2_conf == 0.0 or yolo_result['confidence'] > best_p2_conf:
-                best_p2_conf = yolo_result['confidence']
+            secondary_conf = yolo_result.get('secondary_confidence', 0.0)
+            if secondary_conf > scene_best_p2_conf.get(si_snap, 0.0):
+                scene_best_p2_conf[si_snap] = secondary_conf
                 bbox2 = yolo_result['secondary_bbox']
                 x1, y1, x2, y2 = max(0, int(bbox2[0])), max(0, int(bbox2[1])), min(frame_w, int(bbox2[2])), min(frame_h, int(bbox2[3]))
                 if x2 > x1 and y2 > y1:
-                    p2_snapshot_bgr = frame_resized[y1:y2, x1:x2].copy()
+                    scene_p2_snapshots[si_snap] = frame_resized[y1:y2, x1:x2].copy()
 
         if not anchor_initialized:
             si = _get_scene_index(i, scene_boundaries)
@@ -1538,7 +1540,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         progress_callback(85, 100, "Generating action points...")
 
     action_generator = ActionPointGenerator(fps)
-    actions = action_generator.generate(
+    actions, physics_stats = action_generator.generate(
         position_normalized, segments, 
         velocity_signal=velocity_smoothed,
         impact_bounce_intensity=cfg.impact_bounce_intensity,
@@ -1568,11 +1570,52 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     output_path = os.path.join(video_dir, base_name + ".funscript")
 
+    def _encode_b64(img_bgr):
+        if img_bgr is None: return None
+        # Max resolution for snapshot is 150px height
+        h, w = img_bgr.shape[:2]
+        if h > 150: img_bgr = cv2.resize(img_bgr, (int(w * 150/h), 150))
+        ret, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return base64.b64encode(buf.tobytes()).decode('utf-8') if ret else None
+
     roi_info = []
     for i, (roi, (s, e)) in enumerate(zip(per_scene_rois, scene_boundaries)):
+        sc_config = cfg.scene_configs[i] if i < len(cfg.scene_configs) else None
+        is_user_enabled = sc_config.enabled if sc_config else True
+        
+        # Slice metrics for this scene
+        sc_yolo = yolo_confs[s:e] if yolo_confs else []
+        sc_ncc = anchor_ncc_scores[s:e] if anchor_ncc_scores else []
+        
+        avg_conf = float(np.mean([c for c in sc_yolo if c is not None])) if any(c is not None for c in sc_yolo) else 0.0
+        sc_loss = float(sum(1 for c in sc_yolo if c is None or c < 0.2)) / max(len(sc_yolo), 1) if len(sc_yolo) > 0 else 1.0
+        avg_ncc = float(np.mean([n for n in sc_ncc if n is not None])) if any(n is not None for n in sc_ncc) else 0.0
+        
+        # Determine Status
+        status = "Processed"
+        if not is_user_enabled:
+            status = "User Skipped"
+        else:
+            # Check if it was purely QUIET/transition during generation
+            # (This is approximate as segments are used for generation)
+            if all(t == 'QUIET' for s2, e2, t in segments if s2 >= s and e2 <= e):
+                status = "Auto Skipped (Quiet)"
+        
+        n_p = len(per_scene_persons[i]) if i < len(per_scene_persons) else 0
+        person_names = [p.get('name', 'Person') for p in per_scene_persons[i]] if i < len(per_scene_persons) else []
+        
         roi_info.append({
             "scene": i + 1,
+            "status": status,
             "frames": [int(s), int(e)],
+            "duration_s": round((e - s) / fps, 1),
+            "person_count": n_p,
+            "person_names": person_names,
+            "yolo_avg_conf": round(avg_conf, 3),
+            "tracking_loss": round(sc_loss, 3),
+            "ncc_stability": round(avg_ncc, 3),
+            "p1_snapshot_b64": _encode_b64(scene_p1_snapshots.get(i)),
+            "p2_snapshot_b64": _encode_b64(scene_p2_snapshots.get(i)),
             "y_range": [round(float(roi[0]), 3), round(float(roi[1]), 3)],
             "x_range": [round(float(roi[2]), 3), round(float(roi[3]), 3)]
         })
@@ -1599,14 +1642,6 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                 if not anomaly_timestamps or time_ms - anomaly_timestamps[-1] > 1000:
                     anomaly_timestamps.append(time_ms)
                     
-    def _encode_b64(img_bgr):
-        if img_bgr is None: return None
-        # Max resolution for snapshot is 150px height
-        h, w = img_bgr.shape[:2]
-        if h > 150: img_bgr = cv2.resize(img_bgr, (int(w * 150/h), 150))
-        ret, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        return base64.b64encode(buf.tobytes()).decode('utf-8') if ret else None
-
     output_script = {
         "actions": actions,
         "inverted": False,
@@ -1643,8 +1678,16 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
                 "anchor_reliability": round(anchor_reliability, 3),
                 "manual_anchor_ncc": round(manual_anchor_ncc, 3),
                 "anomaly_timestamps": anomaly_timestamps,
-                "p1_snapshot_b64": _encode_b64(p1_snapshot_bgr),
-                "p2_snapshot_b64": _encode_b64(p2_snapshot_bgr)
+                "p1_snapshot_b64": _encode_b64(next(iter(scene_p1_snapshots.values())) if scene_p1_snapshots else None),
+                "p2_snapshot_b64": _encode_b64(next(iter(scene_p2_snapshots.values())) if scene_p2_snapshots else None),
+                "physics_stats": physics_stats,
+                "selected_bounce_intensity": cfg.impact_bounce_intensity,
+                "auto_floor_align": cfg.auto_floor_align,
+                "environment": {
+                   "device": str(DEVICE),
+                   "res_width": RESIZE_WIDTH,
+                   "fps": round(fps, 2)
+                }
             }
         },
         "range": 100
@@ -2141,7 +2184,7 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
 
     action_generator = ActionPointGenerator(fps)
     # Note: Using default True if cfg not available in legacy
-    actions = action_generator.generate(
+    actions, physics_stats = action_generator.generate(
         position_normalized, segments, 
         velocity_signal=velocity_smoothed,
         impact_bounce_intensity=cfg.impact_bounce_intensity if 'cfg' in locals() else 25.0,

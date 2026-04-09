@@ -271,6 +271,8 @@ def generate_html_report(filename, scores, meta, plot_b64, filepath):
             h2 {{ color: #2980b9; margin-top: 30px; }}
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }}
             .card {{ background: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; border-radius: 4px; }}
+            .card-physics {{ border-left-color: #9b59b6; }}
+            .card-env {{ border-left-color: #2ecc71; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
             th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
             th {{ background-color: #f2f2f2; color: #333; }}
@@ -278,6 +280,17 @@ def generate_html_report(filename, scores, meta, plot_b64, filepath):
             .score-med {{ color: #f39c12; font-weight: bold; }}
             .score-low {{ color: #c0392b; font-weight: bold; }}
             img.plot {{ width: 100%; height: auto; margin-top: 20px; border: 1px solid #eee; border-radius: 4px; }}
+            .scene-row:hover {{ background-color: #f1f8ff; }}
+            .badge {{ padding: 2px 6px; border-radius: 4px; font-size: 0.85em; font-weight: bold; color: white; }}
+            .status-processed {{ bgcolor: #27ae60; background-color: #27ae60; }}
+            .status-skipped {{ bgcolor: #e67e22; background-color: #e67e22; }}
+            .status-quiet {{ bgcolor: #95a5a6; background-color: #95a5a6; }}
+            .quality-bar {{ height: 4px; background: #eee; width: 100%; margin-top: 4px; border-radius: 2px; }}
+            .quality-fill {{ height: 100%; border-radius: 2px; }}
+            .scene-targets {{ display: flex; gap: 4px; }}
+            .scene-target-img {{ height: 48px; width: 48px; border-radius: 4px; object-fit: cover; border: 2px solid #ccc; }}
+            .p1-border {{ border-color: #e74c3c; }}
+            .p2-border {{ border-color: #3498db; }}
         </style>
     </head>
     <body>
@@ -290,30 +303,87 @@ def generate_html_report(filename, scores, meta, plot_b64, filepath):
                 <div class="card">
                     <h2>Tracking Quality (YOLO)</h2>
                     <table>
-                        <tr><th>P1 Avg Confidence</th><td>{meta.get('tracking_quality', {}).get('yolo_p1_confidence_avg', 0.0):.3f}</td></tr>
-                        <tr><th>Tracking Loss Ratio</th><td>{meta.get('tracking_quality', {}).get('tracking_loss_ratio', 0.0):.1%}</td></tr>
-                        <tr><th>Dual Presence (P1&P2)</th><td>{meta.get('tracking_quality', {}).get('dual_presence_ratio', 0.0):.1%}</td></tr>
-                        <tr><th>Anchor Reliability (LK)</th><td>{meta.get('tracking_quality', {}).get('anchor_reliability', 0.0):.1%}</td></tr>
-                        <tr><th>Manual Anchor Stability (NCC)</th><td class="{'score-high' if meta.get('tracking_quality', {}).get('manual_anchor_ncc', 0.0)>0.85 else 'score-med'}">{meta.get('tracking_quality', {}).get('manual_anchor_ncc', 0.0):.1%}</td></tr>
-                        <tr><th>Anomalies Detected</th><td>{len(meta.get('tracking_quality', {}).get('anomaly_timestamps', []))} times</td></tr>
+                        <tr><th>P1 Avg Confidence</th><td>{tq.get('yolo_p1_confidence_avg', 0.0):.3f}</td></tr>
+                        <tr><th>Tracking Loss Ratio</th><td>{tq.get('tracking_loss_ratio', 0.0):.1%}</td></tr>
+                        <tr><th>Dual Presence (P1&P2)</th><td>{tq.get('dual_presence_ratio', 0.0):.1%}</td></tr>
+                        <tr><th>Anchor Reliability (LK)</th><td>{tq.get('anchor_reliability', 0.0):.1%}</td></tr>
+                        <tr><th>Visual Match Stability</th><td class="{'score-high' if tq.get('manual_anchor_ncc', 0.0)>0.82 else 'score-med'}">{tq.get('manual_anchor_ncc', 0.0):.1%}</td></tr>
+                        <tr><th>Anomalies Detected</th><td>{len(tq.get('anomaly_timestamps', []))} times</td></tr>
                     </table>
                 </div>
-                <div class="card">
-                    <h2>Signal Comparison (vs Manual)</h2>
+                <div class="card card-physics">
+                    <h2>Physics & Signal Engine</h2>
                     <table>
-                        <tr><th>DTW Similarity</th><td class="{'score-high' if scores['dtw_similarity']>0.8 else 'score-med'}">{scores['dtw_similarity']:.3f}</td></tr>
-                        <tr><th>Coverage</th><td>{scores['coverage']:.1%}</td></tr>
-                        <tr><th>Action Count Ratio</th><td>{scores['density_ratio']:.2f}x</td></tr>
-                        <tr><th>Mean Abs Error (MAE)</th><td>{scores['mae']:.2f} (pos)</td></tr>
+                        <tr><th>Selected Intensity</th><td>{tq.get('selected_bounce_intensity', 0)}% (Target Height)</td></tr>
+                        <tr><th>Impact Rebounds</th><td>{tq.get('physics_stats', {}).get('bounce_count', 0)} points</td></tr>
+                        <tr><th>Floor Alignments</th><td>{tq.get('physics_stats', {}).get('floor_snap_count', 0)} points</td></tr>
+                        <tr style="font-size: 0.85em; color: #7f8c8d;">
+                            <th>└ Skipped (Too Fast)</th><td>{tq.get('physics_stats', {}).get('bounce_skipped_fast', 0)} times</td></tr>
+                        <tr style="font-size: 0.85em; color: #7f8c8d;">
+                            <th>└ Skipped (Weak Stroke)</th><td>{tq.get('physics_stats', {}).get('bounce_skipped_weak', 0)} times</td></tr>
+                        <tr><th>Auto Floor Correction</th><td>{'Enabled' if tq.get('auto_floor_align', True) else 'Disabled'}</td></tr>
+                        <tr><th>Execution Device</th><td>{tq.get('environment', {}).get('device', 'CPU')} ({tq.get('environment', {}).get('res_width', 768)}px)</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="grid" style="grid-template-columns: 1fr;">
+                <div class="card card-env">
+                    <h2>Analysis Results (vs Manual)</h2>
+                    <table style="width: 100%;">
+                        <tr style="display: flex; justify-content: space-between;">
+                            <td style="border:none;"><b>DTW Similarity:</b> <span class="{'score-high' if scores['dtw_similarity']>0.8 else 'score-med'}">{scores['dtw_similarity']:.3f}</span></td>
+                            <td style="border:none;"><b>Coverage:</b> {scores['coverage']:.1%}</td>
+                            <td style="border:none;"><b>Action Density:</b> {scores['density_ratio']:.2f}x</td>
+                            <td style="border:none;"><b>Mean Abs Error:</b> {scores['mae']:.2f}</td>
+                        </tr>
                     </table>
                 </div>
             </div>
             
             <h2>Timeline Visualization</h2>
             <img class="plot" src="data:image/png;base64,{plot_b64}" alt="Timeline Plot"/>
+
+            <h2>Detailed Scene Breakdown</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Scene</th>
+                        <th>Status</th>
+                        <th>Frames / Duration</th>
+                        <th>Targets</th>
+                        <th>YOLO Trk</th>
+                        <th>Stability</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {"".join([
+                        f'''<tr class="scene-row">
+                            <td>#{s["scene"]}</td>
+                            <td><span class="badge status-{"processed" if s.get("status")=="Processed" else "skipped" if s.get("status")=="User Skipped" else "quiet"}">{s.get("status", "Unknown")}</span></td>
+                            <td>{s["frames"][0]}-{s["frames"][1]}<br/><small style="color: #7f8c8d;">{s.get("duration_s", 0)}s</small></td>
+                            <td>
+                                <div class="scene-targets">
+                                    {f'<img class="scene-target-img p1-border" src="data:image/jpeg;base64,{s["p1_snapshot_b64"]}" title="Primary (P1)">' if s.get("p1_snapshot_b64") else ''}
+                                    {f'<img class="scene-target-img p2-border" src="data:image/jpeg;base64,{s["p2_snapshot_b64"]}" title="Secondary (P2)">' if s.get("p2_snapshot_b64") else ''}
+                                    {f'<small style="color: #7f8c8d; align-self: center;">{", ".join(s.get("person_names", []))}</small>' if not s.get("p1_snapshot_b64") and s.get("person_names") else ''}
+                                </div>
+                            </td>
+                            <td>
+                                {s.get("yolo_avg_conf", 0):.1%}
+                                <div class="quality-bar"><div class="quality-fill" style="width: {s.get("yolo_avg_conf", 0)*100}%; background-color: {'#27ae60' if s.get('yolo_avg_conf', 0)>0.8 else '#f1c40f' if s.get('yolo_avg_conf', 0)>0.4 else '#e74c3c'};"></div></div>
+                            </td>
+                            <td>
+                                {s.get("ncc_stability", 0):.1%}
+                                <div class="quality-bar"><div class="quality-fill" style="width: {s.get("ncc_stability", 0)*100}%; background-color: {'#3498db' if s.get('ncc_stability', 0)>0.7 else '#95a5a6'};"></div></div>
+                            </td>
+                        </tr>''' for s in meta.get('roi_per_scene', [])
+                    ])}
+                </tbody>
+            </table>
             
             <div style="margin-top: 40px; font-size: 0.9em; color: #7f8c8d; text-align: center;">
-                Generated automatically by Eroscript Maker Evaluator
+                Generated automatically by Eroscript Maker Pipeline (v3.1)
             </div>
         </div>
     </body>

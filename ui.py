@@ -949,6 +949,24 @@ async def main(page: ft.Page):
             if item._input_event:
                 item._input_event.set()
 
+        def _on_tab_change(e):
+            # If switching to Persons (1) or Manual Hip (2) tab,
+            # ensure the current scene index is pointing to an enabled scene.
+            if e.control.selected_index == 1: # Persons
+                if not toggles[f1_idx[0]].value:
+                    for i2, sw2 in enumerate(toggles):
+                        if sw2.value:
+                            f1_idx[0] = i2
+                            _f1_refresh()
+                            break
+            elif e.control.selected_index == 2: # Manual Hip
+                if not toggles[f2_idx[0]].value:
+                    for i2, sw2 in enumerate(toggles):
+                        if sw2.value:
+                            f2_idx[0] = i2
+                            _f2_refresh()
+                            break
+
         _tab_pad = ft.Padding.symmetric(horizontal=8, vertical=10)
         tabs = ft.Tabs(
             content=ft.Column([
@@ -967,6 +985,7 @@ async def main(page: ft.Page):
             ]),
             length=4,
             selected_index=0,
+            on_change=_on_tab_change,
             expand=True,
         )
 
