@@ -64,6 +64,8 @@ class Pass1Result:
     video_type         : str
     yolo_tracker       : object  # YoloPoseTracker (or None)
     flow_estimator     : object  # OpticalFlowEstimator
+    tracker_type       : str     = 'yolo'
+    use_reid           : bool    = True
 
 
 @_dataclass
@@ -73,11 +75,20 @@ class UserConfig:
     generate_report         : bool  = True  # 검증 리포트 자동 생성 여부
     impact_bounce_intensity : float = 25.0  # 타격 반반력 강도 (0~100)
     auto_floor_align        : bool  = True  # 바닥 기준점 자동 보정 여부
+    tracker_type            : str   = 'yolo' # 'yolo' | 'humanart'
+    use_reid                : bool  = True
 
     @classmethod
     def auto_from_pass1(cls, r: 'Pass1Result') -> 'UserConfig':
         """자동 기본 설정 — 모든 씬 활성화, person 인덱스 기본값."""
-        return cls(scene_configs=[SceneConfig() for _ in r.scene_boundaries])
+        from algorithms import config
+        t_type = config.get('tracker', 'model_type', 'yolo')
+        u_reid = config.get('tracking', 'use_reid', True)
+        return cls(
+            scene_configs=[SceneConfig() for _ in r.scene_boundaries],
+            tracker_type=t_type,
+            use_reid=u_reid
+        )
 
 
 def _extract_scene_frame(video_path: str, frame_idx: int):
@@ -916,9 +927,23 @@ def pass1_analyze(video_path: str, progress_callback=None):
     if progress_callback:
         progress_callback(3, 100, f"classified:{video_type}")
 
-    # YoloPoseTracker 초기화
+    # Tracker 초기화 (YOLO vs HumanArt+ReID)
+    from algorithms import config, OnnxHumanArtTracker, YOLOX_PATH, RTMPOSE_PATH, OSNET_PATH
+    
+    tracker_type = config.get('tracker', 'model_type', 'yolo')
+    use_reid = config.get('tracking', 'use_reid', True)
     yolo_tracker = None
-    if YOLO_AVAILABLE:
+
+    if tracker_type == 'humanart':
+        try:
+            osnet_p = OSNET_PATH if use_reid else None
+            yolo_tracker = OnnxHumanArtTracker(YOLOX_PATH, RTMPOSE_PATH, osnet_p, device='cuda', fps=fps)
+            print(f"OnnxHumanArtTracker enabled (ReID: {use_reid}, device: {DEVICE})")
+        except Exception as e:
+            print(f"OnnxHumanArtTracker init failed: {e}")
+            tracker_type = 'yolo' # Fallback to YOLO
+
+    if tracker_type == 'yolo' and YOLO_AVAILABLE:
         model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'models', 'yolo26x-pose.pt')
         try:
@@ -1011,6 +1036,8 @@ def pass1_analyze(video_path: str, progress_callback=None):
         video_type         = video_type,
         yolo_tracker       = yolo_tracker,
         flow_estimator     = flow_estimator,
+        tracker_type       = tracker_type,
+        use_reid           = use_reid
     )
 
 
@@ -1114,6 +1141,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
     head_hip_dists = []
     anchor_dists   = []
     anchor_ncc_scores = []
+    yolo_reid_sims = []   # ReID similarity of P1
     contact_tracker    = ContactPointTracker()
     anchor_tracker     = DualAnchorTracker()
     anchor_initialized = False
@@ -1250,11 +1278,13 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
         yolo_p2_confs.append(yolo_result.get('secondary_confidence', 0.0))
         yolo_rel_dists.append(yolo_result.get('rel_dist'))
         yolo_is_duals.append(yolo_result.get('is_dual', False))
+        yolo_reid_sims.append(yolo_result.get('reid_similarity'))
         scene_types.append(scene_type)
         head_hip_dists.append(_compute_bj_dist(yolo_result, frame_h))
         quality_records.append({
             'conf'         : yolo_result.get('confidence', 0.0),
             'is_dual'      : yolo_result.get('is_dual', False),
+            'reid_sim'     : yolo_result.get('reid_similarity', 0.0),
             'near_boundary': i in boundary_frame_set,
         })
 
@@ -1622,6 +1652,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
 
     # --- Analytics & Diagnostics ---
     yolo_p1_conf_avg = float(np.mean([c for c in yolo_confs if c is not None])) if yolo_confs else 0.0
+    reid_sim_avg = float(np.mean([s for s in yolo_reid_sims if s is not None])) if yolo_reid_sims else 0.0
     tracking_loss_ratio = float(sum(1 for c in yolo_confs if c is None or c < 0.2)) / max(len(yolo_confs), 1)
     
     # New integrity metrics
@@ -1673,6 +1704,7 @@ def pass2_extract(video_path: str, r: Pass1Result, cfg: UserConfig,
             },
             "tracking_quality": {
                 "yolo_p1_confidence_avg": round(yolo_p1_conf_avg, 3),
+                "reid_p1_similarity_avg": round(reid_sim_avg, 3),
                 "tracking_loss_ratio": round(tracking_loss_ratio, 3),
                 "dual_presence_ratio": round(dual_presence_ratio, 3),
                 "anchor_reliability": round(anchor_reliability, 3),
@@ -1928,11 +1960,13 @@ def _run_analysis_legacy(video_path, progress_callback=None, frame_callback=None
         yolo_confs.append(yolo_result['confidence'])
         yolo_rel_dists.append(yolo_result.get('rel_dist'))
         yolo_is_duals.append(yolo_result.get('is_dual', False))
+        yolo_reid_sims.append(yolo_result.get('reid_similarity'))
         scene_types.append(scene_type)
         head_hip_dists.append(_compute_bj_dist(yolo_result, frame_h))
         quality_records.append({
             'conf'         : yolo_result.get('confidence', 0.0),
             'is_dual'      : yolo_result.get('is_dual', False),
+            'reid_sim'     : yolo_result.get('reid_similarity', 0.0),
             'near_boundary': i in boundary_frame_set,
         })
 

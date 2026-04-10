@@ -24,7 +24,11 @@ from tracking import (
     DEVICE,
     RESIZE_WIDTH,
     YOLO_AVAILABLE,
-    AffineResult
+    AffineResult,
+    OnnxHumanArtTracker,
+    YOLOX_PATH,
+    RTMPOSE_PATH,
+    OSNET_PATH
 )
 
 # Constants used by main.py

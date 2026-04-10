@@ -12,3 +12,4 @@ flet-dropzone>=0.3.1
 
 # YOLO pose for person detection + hip keypoints
 ultralytics>=8.0.0
+onnxruntime-gpu

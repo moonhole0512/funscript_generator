@@ -3,6 +3,7 @@ import flet as ft
 import os
 import threading
 import traceback
+import json
 from main import run_analysis, pass1_analyze, pass2_extract, UserConfig
 
 # flet-dropzone requires `flet build windows` (VS2022 + Flutter SDK) to work.
@@ -1169,6 +1170,49 @@ async def main(page: ft.Page):
         "Transform video motion into precision haptic scripts",
         size=13, color=ft.Colors.GREY_400, text_align=ft.TextAlign.CENTER,
     )
+    
+    # ── Tracker Settings ─────────────────────────────────────────────────
+    from algorithms import config as global_config
+    
+    current_model = global_config.get('tracker', 'model_type', 'yolo')
+    current_reid = global_config.get('tracking', 'use_reid', True)
+    
+    def on_tracker_change(e):
+        new_val = "humanart" if tracker_toggle.value else "yolo"
+        global_config.set('tracker', 'model_type', new_val)
+        status_text.value = f"Tracker changed to: {new_val.upper()}"
+        _schedule_update()
+
+    def on_reid_change(e):
+        new_val = reid_switch.value
+        global_config.set('tracking', 'use_reid', new_val)
+        status_text.value = f"OSNet ReID: {'ON' if new_val else 'OFF'}"
+        _schedule_update()
+
+    tracker_toggle = ft.Switch(
+        label="HumanArt (Animation Engine)",
+        value=(current_model == "humanart"),
+        active_color=ft.Colors.CYAN_ACCENT,
+        on_change=on_tracker_change,
+    )
+    
+    reid_switch = ft.Switch(
+        label="OSNet ReID (ID Fix)",
+        value=current_reid,
+        active_color=ft.Colors.PINK_ACCENT,
+        on_change=on_reid_change,
+    )
+    
+    settings_row = ft.Row(
+        [
+            ft.Text("Engine:", size=13, color=ft.Colors.GREY_400),
+            tracker_toggle,
+            ft.VerticalDivider(width=1, color=ft.Colors.GREY_800),
+            reid_switch,
+        ],
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=20,
+    )
 
     page.add(
         ft.Column(
@@ -1176,6 +1220,8 @@ async def main(page: ft.Page):
                 ft.Container(height=6),
                 title,
                 subtitle,
+                ft.Container(height=6),
+                settings_row,
                 ft.Container(height=10),
                 drop_zone,
                 ft.Container(height=10),

@@ -5,14 +5,21 @@ import numpy as np
 import cv2
 import torchvision.transforms as transforms
 from torchvision.models.optical_flow import raft_large, raft_small, Raft_Large_Weights, Raft_Small_Weights
-from collections import namedtuple
+from collections import namedtuple, deque
 from config_manager import config
 from signal_processing import OneEuroFilter
+import onnxruntime as ort
+from scipy.optimize import linear_sum_assignment
 
 # Internal Defaults
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 RAFT_SMALL = False
 RESIZE_WIDTH = 512
+
+# ONNX Models Paths
+YOLOX_PATH = r"d:\_Development\Eroscript_maker\models\yolox_x_8xb8-300e_humanart-onnx\20230928\yolox_onnx\yolox_x_8xb8-300e_humanart-a39d44ed\end2end.onnx"
+RTMPOSE_PATH = r"d:\_Development\Eroscript_maker\models\rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611\20230831\rtmpose_onnx\rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611\end2end.onnx"
+OSNET_PATH = r"d:\_Development\Eroscript_maker\models\osnet_x0_25.onnx"
 
 try:
     from ultralytics import YOLO as _YOLO_CHECK
@@ -917,3 +924,479 @@ class MotionExtractor:
         velocity = -flow_y[mask].mean().item()
         magnitude = flow_mag[mask].mean().item()
         return velocity, magnitude, roi_height_px, False
+
+# ── ONNX-based HumanArt & ReID Components ─────────────────────────────────
+
+class YoloxDetector:
+    def __init__(self, model_path, device='cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        # Try to use CUDA if requested, fallback to CPU if it fails
+        try:
+            self.session = ort.InferenceSession(model_path, providers=providers)
+        except Exception as e:
+            print(f"[WARNING] Failed to load YOLOX with CUDA, falling back to CPU: {e}")
+            self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_shape = self.session.get_inputs()[0].shape # [1, 3, 640, 640]
+
+    def detect(self, img_bgr, conf_thr=0.4):
+        h, w = img_bgr.shape[:2]
+        # YOLOX Preprocess: Resize keep_ratio, pad to 640x640 with 114
+        input_size = (640, 640)
+        scale = min(input_size[0] / h, input_size[1] / w)
+        nh, nw = int(h * scale), int(w * scale)
+        img_resized = cv2.resize(img_bgr, (nw, nh))
+        
+        img_pad = np.full((input_size[0], input_size[1], 3), 114, dtype=np.uint8)
+        img_pad[:nh, :nw, :] = img_resized
+        
+        # BGR to NCHW
+        img_in = img_pad.transpose(2, 0, 1)[None, :].astype(np.float32)
+        
+        outputs = self.session.run(None, {self.input_name: img_in})
+        dets, labels = outputs[0][0], outputs[1][0] # [N, 5], [N]
+        
+        results = []
+        for i in range(len(dets)):
+            if labels[i] == 0 and dets[i][4] >= conf_thr: # class 0 is person
+                # Rescale bbox to original image
+                x1, y1, x2, y2, score = dets[i]
+                x1, y1, x2, y2 = x1 / scale, y1 / scale, x2 / scale, y2 / scale
+                results.append({
+                    'bbox': (float(x1), float(y1), float(x2), float(y2)),
+                    'confidence': float(score)
+                })
+        return results
+
+class RTMPoseEstimator:
+    def __init__(self, model_path, device='cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        try:
+            self.session = ort.InferenceSession(model_path, providers=providers)
+        except Exception as e:
+            print(f"[WARNING] Failed to load RTMPose with CUDA, falling back to CPU: {e}")
+            self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            
+        self.input_name = self.session.get_inputs()[0].name
+        self.mean = np.array([123.675, 116.28, 103.53], dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array([58.395, 57.12, 57.375], dtype=np.float32).reshape(1, 1, 3)
+
+    def estimate(self, img_bgr, bboxes):
+        if not bboxes: return []
+        
+        results = []
+        for bbox in bboxes:
+            x1, y1, x2, y2 = bbox
+            bw, bh = x2 - x1, y2 - y1
+            
+            # TopDown Get Center/Scale (mmdet style)
+            center = np.array([x1 + bw * 0.5, y1 + bh * 0.5], dtype=np.float32)
+            scale = np.array([bw / 192, bh / 256], dtype=np.float32) * 1.25 # Padding 1.25
+            
+            # Affine Transform
+            trans = self._get_affine_transform(center, scale, [192, 256])
+            img_crop = cv2.warpAffine(img_bgr, trans, (192, 256), flags=cv2.INTER_LINEAR)
+            
+            # Preprocess: RGB, Normalize, NCHW
+            img_in = cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB).astype(np.float32)
+            img_in = (img_in - self.mean) / self.std
+            img_in = img_in.transpose(2, 0, 1)[None, :]
+            
+            outputs = self.session.run(None, {self.input_name: img_in})
+            simcc_x, simcc_y = outputs[0], outputs[1] # [1, 17, 384], [1, 17, 512]
+            
+            # Decode SimCC
+            kps_raw = self._decode_simcc(simcc_x[0], simcc_y[0], 2.0) # [17, 3]
+            
+            # Transform back to original image
+            kps_img = kps_raw.copy()
+            for i in range(len(kps_img)):
+                kps_img[i, :2] = self._apply_affine_transform_pt(kps_raw[i, :2], trans, invert=True)
+            
+            results.append(kps_img)
+        return results
+
+    def _get_affine_transform(self, center, scale, output_size):
+        # mmdeploy inspired simplified affine
+        src_w = scale[0] * 192
+        src_h = scale[1] * 256
+        dst_w, dst_h = output_size
+        
+        src_pts = np.zeros((3, 2), dtype=np.float32)
+        dst_pts = np.zeros((3, 2), dtype=np.float32)
+        
+        src_pts[0, :] = center
+        src_pts[1, :] = center + [src_w * 0.5, 0]
+        src_pts[2, :] = center + [0, src_h * 0.5]
+        
+        dst_pts[0, :] = [dst_w * 0.5, dst_h * 0.5]
+        dst_pts[1, :] = [dst_w, dst_h * 0.5]
+        dst_pts[2, :] = [dst_w * 0.5, dst_h]
+        
+        return cv2.getAffineTransform(src_pts, dst_pts)
+
+    def _apply_affine_transform_pt(self, pt, trans, invert=False):
+        if invert:
+            m = cv2.invertAffineTransform(trans)
+        else:
+            m = trans
+        new_pt = np.array([pt[0], pt[1], 1.]).T
+        return np.dot(m, new_pt)
+
+    def _decode_simcc(self, simcc_x, simcc_y, split_ratio=2.0):
+        # simcc_x: [17, 384], simcc_y: [17, 512]
+        kps = np.zeros((simcc_x.shape[0], 3), dtype=np.float32)
+        for i in range(simcc_x.shape[0]):
+            x_idx = np.argmax(simcc_x[i])
+            y_idx = np.argmax(simcc_y[i])
+            conf = (np.max(simcc_x[i]) + np.max(simcc_y[i])) / 2.0
+            kps[i, 0] = x_idx / split_ratio
+            kps[i, 1] = y_idx / split_ratio
+            kps[i, 2] = conf
+        return kps
+
+class OSNetTracker:
+    def __init__(self, model_path, device='cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        try:
+            self.session = ort.InferenceSession(model_path, providers=providers)
+        except Exception as e:
+            print(f"[WARNING] Failed to load OSNet with CUDA, falling back to CPU: {e}")
+            self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            
+        self.input_name = self.session.get_inputs()[0].name
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+    def extract_features(self, img_bgr, bboxes):
+        if not bboxes: return []
+        features = []
+        for bbox in bboxes:
+            x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
+            crop = img_bgr[y1:y2, x1:x2]
+            if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+                features.append(np.zeros(512, dtype=np.float32))
+                continue
+            
+            # Preprocess: RGB, 256x128, Normalize, NCHW
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_resized = cv2.resize(crop_rgb, (128, 256))
+            crop_in = crop_resized.astype(np.float32) / 255.0
+            crop_in = (crop_in - self.mean) / self.std
+            crop_in = crop_in.transpose(2, 0, 1)
+            
+            # OSNet model has fixed batch size of 16
+            batch_img = np.zeros((16, 3, 256, 128), dtype=np.float32)
+            batch_img[0] = crop_in
+            
+            feat = self.session.run(None, {self.input_name: batch_img})[0][0]
+            # Normalize embedding
+            feat = feat / (np.linalg.norm(feat) + 1e-6)
+            features.append(feat)
+        return features
+
+class OnnxHumanArtTracker:
+    def __init__(self, yolox_path, rtmpose_path, osnet_path=None, device='cuda', fps=30.0):
+        self._detector = YoloxDetector(yolox_path, device)
+        self._pose_estimator = RTMPoseEstimator(rtmpose_path, device)
+        self._reid = OSNetTracker(osnet_path, device) if osnet_path else None
+        self._fps = fps
+        self._slots = []
+        self._track_id_map = {}
+        self._frame_count = 0
+        self._psp = {
+            'p1': {'ref_lens': deque(maxlen=60), 'avg_ref': 0.15}, 
+            'p2': {'ref_lens': deque(maxlen=60), 'avg_ref': 0.15}
+        }
+        
+        # Identity Thresholds
+        self.REID_THRESHOLD = 0.45 # Cosine similarity threshold
+        self.MAX_MISS_FRAMES = 30
+        self.MAX_SLOTS = 5
+        self.SLOT_MATCH_DIST = 0.30
+        self._feature_alpha = 0.20 # EMA alpha for features
+
+    def process_frame(self, frame_bgr, roi_fractions=None):
+        self._frame_count += 1
+        fh, fw = frame_bgr.shape[:2]
+        
+        # 1. Detect Persons
+        detections = self._detector.detect(frame_bgr, conf_thr=0.4)
+        
+        # Filter by ROI if provided
+        if roi_fractions:
+            ry1, ry2, rx1, rx2 = roi_fractions
+            filtered = []
+            for d in detections:
+                bbox = d['bbox']
+                cx, cy = (bbox[0] + bbox[2]) / 2 / fw, (bbox[1] + bbox[3]) / 2 / fh
+                # ROI Gating with margin
+                margin = 0.05
+                if (rx1-margin) <= cx <= (rx2+margin) and (ry1-margin) <= cy <= (ry2+margin):
+                    filtered.append(d)
+            detections = filtered
+
+        # 1.5 Deduplication (Person NMS)
+        detections = self._manual_nms(detections, iou_threshold=0.60)
+
+        if not detections:
+            return self._empty_result()
+
+        # 2. Extract Pose for all detections (limited to Top N for safety)
+        detections = detections[:self.MAX_SLOTS]
+        bboxes = [d['bbox'] for d in detections]
+        keypoints_list = self._pose_estimator.estimate(frame_bgr, bboxes)
+        
+        # 3. Extract ReID features if enabled
+        features = self._reid.extract_features(frame_bgr, bboxes) if self._reid else [None] * len(detections)
+        
+        # Build person objects
+        persons = []
+        from collections import deque
+        for i, (d, kp, feat) in enumerate(zip(detections, keypoints_list, features)):
+            bbox = d['bbox']
+            p = {
+                'confidence': d['confidence'],
+                'bbox': bbox,
+                'keypoints': kp,
+                'feature': feat,
+                'cx': (bbox[0] + bbox[2]) / 2 / fw,
+                'cy': (bbox[1] + bbox[3]) / 2 / fh,
+                'hip_center_y': self._estimate_hip_y_robust(kp, fh),
+                'reference_length': self._estimate_ref_len(kp, bbox, fh)
+            }
+            persons.append(p)
+            
+        # 4. Update Slots
+        return self._update_slots(persons, fw, fh)
+
+    def _estimate_hip_y_robust(self, kp, fh):
+        # Same logic as YoloPoseTracker
+        ws, wt = 0, 0
+        for ki in [11, 12]: # LEFT_HIP, RIGHT_HIP
+            if kp[ki][2] >= 0.25: w = kp[ki][2]; ws += (kp[ki][1]/fh)*w; wt += w
+        return ws/wt if wt > 0 else None
+
+    def _estimate_ref_len(self, kp, bbox, fh):
+        # Same logic as YoloPoseTracker
+        if kp[5][2]>=0.25 and kp[6][2]>=0.25 and (kp[11][2]>=0.25 or kp[12][2]>=0.25):
+            hy = ((kp[11][1] if kp[11][2]>=0.25 else kp[12][1])+(kp[12][1] if kp[12][2]>=0.25 else kp[11][1]))/2
+            ref = abs(hy-(kp[5][1]+kp[6][1])/2)/fh
+            if ref >= 0.04: return ref
+        return (bbox[3]-bbox[1])/fh*0.35
+
+    def _update_slots(self, persons, fw, fh):
+        for s in self._slots: s['miss'] += 1
+        
+        unmatched_ps = list(range(len(persons)))
+        matched_slots = set()
+        
+        active_slots = [i for i, s in enumerate(self._slots) if s['miss'] <= self.MAX_MISS_FRAMES]
+        
+        if active_slots and persons:
+            # ── Global Matching using Hungarian Algorithm ──
+            # Cost = W_reid * (1-reid_sim) + W_iou * (1-iou) + W_dist * dist_norm
+            num_slots = len(active_slots)
+            num_persons = len(persons)
+            cost_matrix = np.zeros((num_slots, num_persons))
+            
+            for i, si in enumerate(active_slots):
+                s = self._slots[si]
+                for j in range(num_persons):
+                    p = persons[j]
+                    
+                    # 1. ReID Similarity (normalized distance)
+                    reid_sim = np.dot(s['last_feature'], p['feature']) if s.get('last_feature') is not None and p['feature'] is not None else 0.0
+                    reid_cost = 1.0 - reid_sim
+                    
+                    # 2. IoU Cost
+                    iou = self._iou(s['bbox'], p['bbox'])
+                    iou_cost = 1.0 - iou
+                    
+                    # 3. Spatial distance cost
+                    dist = ((s['cx'] - p['cx'])**2 + (s['cy'] - p['cy'])**2)**0.5
+                    dist_norm = min(1.0, dist / self.SLOT_MATCH_DIST)
+                    
+                    # Total Cost (Weights: ReID=0.6, IoU=0.2, Dist=0.2)
+                    total_cost = reid_cost * 0.6 + iou_cost * 0.2 + dist_norm * 0.2
+                    
+                    # Gating: If ReID is too low AND it's far away, it's NOT the same person
+                    if reid_sim < self.REID_THRESHOLD * 0.7 and dist > self.SLOT_MATCH_DIST:
+                        total_cost += 10.0 # High penalty
+                        
+                    cost_matrix[i, j] = total_cost
+            
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                if cost_matrix[r, c] < 5.0: # Match quality threshold
+                    si = active_slots[r]
+                    matched_slots.add(si); unmatched_ps.remove(c)
+                    self._assign_to_slot(self._slots[si], persons[c])
+
+        # New Slots for unmatched persons
+        for pi in unmatched_ps:
+            if len(self._slots) < self.MAX_SLOTS:
+                s = {
+                    'cx': persons[pi]['cx'], 'cy': persons[pi]['cy'], 'bbox': persons[pi]['bbox'],
+                    'miss': 0, 'last_feature': persons[pi]['feature'], 'last_result': persons[pi]
+                }
+                self._slots.append(s)
+                matched_slots.add(len(self._slots)-1)
+
+        # Build final result (P1/P2)
+        if not self._slots or self._slots[0]['last_result'] is None:
+            return self._empty_result()
+            
+        # PSP Update
+        if self._slots[0]['miss'] == 0:
+            ref = self._slots[0]['last_result'].get('reference_length')
+            if ref:
+                self._psp['p1']['ref_lens'].append(ref)
+                self._psp['p1']['avg_ref'] = np.median(self._psp['p1']['ref_lens'])
+        
+        p1 = self._slots[0]['last_result']
+        # Compute ReID similarity for P1 if applicable
+        reid_sim = 0.0
+        if self._slots[0]['miss'] == 0:
+            reid_sim = float(np.dot(self._slots[0]['last_feature'], p1['feature'])) if self._slots[0].get('last_feature') is not None else 1.0
+
+        res = {
+            'hip_center_y': p1['hip_center_y'], 'reference_length': p1['reference_length'],
+            'confidence': p1['confidence'], 'bbox': p1['bbox'], 'keypoints': p1['keypoints'],
+            'secondary_hip_y': None, 'secondary_bbox': None, 'secondary_keypoints': None, 
+            'secondary_confidence': 0.0, 'secondary_reference_length': None, 'is_dual': False,
+            'reid_similarity': reid_sim
+        }
+        
+        if len(self._slots) >= 2 and self._slots[1]['last_result'] and self._slots[1]['miss'] <= 1:
+             p2 = self._slots[1]['last_result']
+             # PSP Update P2
+             ref2 = p2.get('reference_length')
+             if ref2:
+                 self._psp['p2']['ref_lens'].append(ref2)
+                 self._psp['p2']['avg_ref'] = np.median(self._psp['p2']['ref_lens'])
+
+             res.update({
+                'secondary_hip_y': p2['hip_center_y'], 'secondary_bbox': p2['bbox'], 
+                'secondary_keypoints': p2['keypoints'], 'secondary_confidence': p2['confidence'],
+                'secondary_reference_length': p2['reference_length'], 'is_dual': True
+            })
+        return res
+
+    def force_slot_reorder_by_hint(self, p1_bbox_hint, p2_bbox_hint):
+        """UI에서 지정한 힌트(bbox)와 가장 가까운 슬롯을 P1, P2로 강제 할당."""
+        if not self._slots: return {}
+        swaps = {}
+        
+        # P1 Hint match
+        if p1_bbox_hint:
+            best_iou, best_si = 0.5, -1
+            for si, s in enumerate(self._slots):
+                iou = self._iou(s['bbox'], p1_bbox_hint)
+                if iou > best_iou: best_iou, best_si = iou, si
+            
+            if best_si != -1 and best_si != 0:
+                # swap slot 0 and best_si
+                self._slots[0], self._slots[best_si] = self._slots[best_si], self._slots[0]
+                swaps[best_si] = 0; swaps[0] = best_si
+
+        # P2 Hint match
+        if p2_bbox_hint and len(self._slots) >= 2:
+            best_iou, best_si = 0.5, -1
+            for si, s in enumerate(self._slots):
+                if si == 0: continue # P1 already handled
+                iou = self._iou(s['bbox'], p2_bbox_hint)
+                if iou > best_iou: best_iou, best_si = iou, si
+            
+            if best_si != -1 and best_si != 1:
+                # swap slot 1 and best_si
+                self._slots[1], self._slots[best_si] = self._slots[best_si], self._slots[1]
+                swaps[best_si] = 1; swaps[1] = best_si
+        
+        return swaps
+
+    def close(self):
+        # ONNX sessions don't need explicit close usually, but for completeness
+        pass
+
+    def _assign_to_slot(self, s, p):
+        s['cx'], s['cy'], s['bbox'], s['miss'] = p['cx'], p['cy'], p['bbox'], 0
+        
+        # Feature EMA for identity robustness
+        if s.get('last_feature') is not None and p['feature'] is not None:
+            s['last_feature'] = self._feature_alpha * p['feature'] + (1 - self._feature_alpha) * s['last_feature']
+            # Re-normalize EMA feature
+            s['last_feature'] = s['last_feature'] / (np.linalg.norm(s['last_feature']) + 1e-6)
+        else:
+            s['last_feature'] = p['feature']
+            
+        s['last_result'] = p
+
+    def _manual_nms(self, detections, iou_threshold=0.60):
+        if not detections: return []
+        # Sort by confidence
+        dets = sorted(detections, key=lambda x: x['confidence'], reverse=True)
+        keep = []
+        for i in range(len(dets)):
+            is_dup = False
+            for j in keep:
+                if self._iou(dets[i]['bbox'], j['bbox']) > iou_threshold:
+                    is_dup = True
+                    break
+            if not is_dup:
+                keep.append(dets[i])
+        return keep
+
+    def _iou(self, b1, b2):
+        if not b1 or not b2: return 0.0
+        ix1, iy1, ix2, iy2 = max(b1[0], b2[0]), max(b1[1], b2[1]), min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        u = (b1[2]-b1[0])*(b1[3]-b1[1]) + (b2[2]-b2[0])*(b2[3]-b2[1]) - inter
+        return float(inter / u) if u > 0 else 0.0
+
+    def _empty_result(self):
+        return {
+            'hip_center_y': None, 'reference_length': None, 'confidence': 0.0, 'bbox': None, 'keypoints': None,
+            'secondary_hip_y': None, 'secondary_bbox': None, 'secondary_keypoints': None, 'is_dual': False
+        }
+
+    def detect_persons_stateless(self, frame_bgr):
+        """Minimal implementation for ROI/Anchor detection (Top-down YOLOX+RTMPose)"""
+        dets = self._detector.detect(frame_bgr, conf_thr=0.4)
+        if not dets: return []
+        
+        bboxes = [d['bbox'] for d in dets]
+        kps_list = self._pose_estimator.estimate(frame_bgr, bboxes)
+        
+        out = []
+        for d, kp in zip(dets, kps_list):
+            bbox = d['bbox']
+            # COCO Keypoints: Left Hip = 11, Right Hip = 12
+            hip_px = None
+            if kp is not None:
+                lh, rh = kp[11], kp[12]
+                if lh[2] > 0.3 and rh[2] > 0.3:
+                    hip_px = (float((lh[0] + rh[0]) / 2), float((lh[1] + rh[1]) / 2))
+                elif lh[2] > 0.3:
+                    hip_px = (float(lh[0]), float(lh[1]))
+                elif rh[2] > 0.3:
+                    hip_px = (float(rh[0]), float(rh[1]))
+            
+            out.append({
+                'bbox': bbox, 
+                'keypoints': kp,
+                'hip_px': hip_px,
+                'confidence': d['confidence'], 
+                'bbox_area': (bbox[2]-bbox[0])*(bbox[3]-bbox[1])
+            })
+        return sorted(out, key=lambda x: x['bbox_area'], reverse=True)
+
+    def reset_tracking(self):
+        self._slots = []
+        self._track_id_map = {}
+        self._frame_count = 0
+
+    def get_psp(self):
+        return {'p1_avg_ref': 0.15, 'p2_avg_ref': 0.15}

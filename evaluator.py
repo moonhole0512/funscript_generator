@@ -239,7 +239,8 @@ def generate_json_diagnostic(orig_actions, prog_actions, meta, scores, filepath)
         "tracking_loss": meta.get("tracking_quality", {}).get("tracking_loss_ratio", 0.0),
         "dual_presence": meta.get("tracking_quality", {}).get("dual_presence_ratio", 0.0),
         "anchor_reliability": meta.get("tracking_quality", {}).get("anchor_reliability", 0.0),
-        "analyzer": "AI Diagnostic Module v2"
+        "reid_stability": meta.get("tracking_quality", {}).get("reid_p1_similarity_avg", 0.0),
+        "analyzer": "AI Diagnostic Module v2.1 (ReID-Aware)"
     }
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(diag, f, indent=2)
@@ -305,6 +306,7 @@ def generate_html_report(filename, scores, meta, plot_b64, filepath):
                     <table>
                         <tr><th>P1 Avg Confidence</th><td>{tq.get('yolo_p1_confidence_avg', 0.0):.3f}</td></tr>
                         <tr><th>Tracking Loss Ratio</th><td>{tq.get('tracking_loss_ratio', 0.0):.1%}</td></tr>
+                        <tr><th>Character Lock (ReID)</th><td class="{'score-high' if tq.get('reid_p1_similarity_avg', 0.0)>0.85 else 'score-med'}">{tq.get('reid_p1_similarity_avg', 0.0):.1%}</td></tr>
                         <tr><th>Dual Presence (P1&P2)</th><td>{tq.get('dual_presence_ratio', 0.0):.1%}</td></tr>
                         <tr><th>Anchor Reliability (LK)</th><td>{tq.get('anchor_reliability', 0.0):.1%}</td></tr>
                         <tr><th>Visual Match Stability</th><td class="{'score-high' if tq.get('manual_anchor_ncc', 0.0)>0.82 else 'score-med'}">{tq.get('manual_anchor_ncc', 0.0):.1%}</td></tr>
